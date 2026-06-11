@@ -41,6 +41,11 @@ go.work.sum
 # Local-only working notes (not published)
 docs/internal/
 
+# Local agent/tool config (machine-local). AGENTS.md/CLAUDE.md are committed;
+# the .agents/ dir (settings) and its .claude symlink stay local.
+.agents/
+.claude
+
 # Example/tooling build artifacts (none are committed).
 # Node (the node example needs no deps):
 node_modules/
