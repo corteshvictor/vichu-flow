@@ -1,0 +1,74 @@
+# GoReleaser config for VichuFlow. Cross-platform binaries for macOS, Linux, Windows.
+# https://goreleaser.com
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: vichu
+    main: ./cmd/vichu
+    binary: vichu
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}
+
+archives:
+  - id: vichu
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+# release-please already created the GitHub release and wrote the changelog from
+# Conventional Commits; GoReleaser only attaches binaries to it.
+release:
+  mode: keep-existing
+
+changelog:
+  disable: true
+
+# Package-manager publishing (post-v1). Uncomment a block once its target repo
+# and a token with write access to it exist. Until then, the prebuilt binaries
+# attached to each GitHub Release are the install path on every OS.
+#
+# brews:
+#   - repository:
+#       owner: corteshvictor
+#       name: homebrew-tap
+#     homepage: https://github.com/corteshvictor/vichu-flow
+#     description: Observable, verifiable agentic workflow orchestration
+# scoops:
+#   - repository:
+#       owner: corteshvictor
+#       name: scoop-bucket
+#     homepage: https://github.com/corteshvictor/vichu-flow
+# winget:
+#   - name: vichu
+#     publisher: corteshvictor
+#     license: MIT
+#     homepage: https://github.com/corteshvictor/vichu-flow
+#     short_description: Observable, verifiable agentic workflow orchestration
+#     repository:
+#       owner: corteshvictor
+#       name: winget-pkgs        # a fork of microsoft/winget-pkgs
+#       branch: "vichu-{{.Version}}"
+#       pull_request:
+#         enabled: true
+#         base:
+#           owner: microsoft
+#           name: winget-pkgs
+#           branch: master

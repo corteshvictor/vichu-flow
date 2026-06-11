@@ -1,0 +1,516 @@
+// Package engine drives a workflow as a persistent state machine. It is the
+// only component that mutates a run's status, and every transition it makes is
+// authorized by verified evidence (worker results, gate verdicts) — never by an
+// agent's self-report. All state lives on disk, so a run survives a crash and
+// resumes from where it stopped.
+package engine
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/corteshvictor/vichu-flow/internal/adapters"
+	"github.com/corteshvictor/vichu-flow/internal/config"
+	"github.com/corteshvictor/vichu-flow/internal/contextpack"
+	"github.com/corteshvictor/vichu-flow/internal/core"
+	"github.com/corteshvictor/vichu-flow/internal/gates"
+	"github.com/corteshvictor/vichu-flow/internal/i18n"
+	"github.com/corteshvictor/vichu-flow/internal/runtime"
+	"github.com/corteshvictor/vichu-flow/internal/security"
+	"github.com/corteshvictor/vichu-flow/internal/workflows"
+	"github.com/corteshvictor/vichu-flow/internal/workspace"
+)
+
+// Engine executes workflows over a single repository.
+type Engine struct {
+	store    *runtime.Store
+	registry *adapters.Registry
+	cfg      *config.Config
+	repo     *workspace.Repo
+	gates    *gates.Runner
+	policy   security.Policy
+	log      func(string)
+}
+
+// Options configures a new Engine.
+type Options struct {
+	Store    *runtime.Store
+	Registry *adapters.Registry
+	Config   *config.Config
+	Repo     *workspace.Repo
+	Log      func(string) // optional progress sink for the CLI
+}
+
+// New builds an Engine.
+func New(opts Options) *Engine {
+	logFn := opts.Log
+	if logFn == nil {
+		logFn = func(string) {
+			// no-op: progress logging is optional (the CLI supplies a sink).
+		}
+	}
+	return &Engine{
+		store:    opts.Store,
+		registry: opts.Registry,
+		cfg:      opts.Config,
+		repo:     opts.Repo,
+		gates:    gates.NewRunner(opts.Store),
+		policy:   security.New(opts.Config.Security),
+		log:      logFn,
+	}
+}
+
+// runState holds the per-run context the loop threads between stages.
+type runState struct {
+	wf          *workflows.Workflow
+	pack        string
+	baseSHA     string
+	lastSummary string
+	startedAt   time.Time
+	// spentBefore is the wall-clock already consumed by previous sessions of
+	// this run (resume accumulates spend; it never resets the meter).
+	spentBefore float64
+}
+
+// wallClockSpent is the run's cumulative wall-clock in seconds.
+func (rs *runState) wallClockSpent() float64 {
+	return rs.spentBefore + time.Since(rs.startedAt).Seconds()
+}
+
+// Start creates a new run and executes it until it completes or blocks.
+func (e *Engine) Start(ctx context.Context, task, workflowName string) (*core.State, error) {
+	if workflowName == "" {
+		workflowName = e.cfg.Workflow.Default
+	}
+	wf, err := workflows.Get(workflowName)
+	if err != nil {
+		return nil, err
+	}
+
+	snap, err := e.repo.Snapshot(e.cfg.Workspace.Isolation)
+	if err != nil {
+		return nil, fmt.Errorf("capturing workspace snapshot: %w", err)
+	}
+
+	runID := runtime.NewRunID(time.Now())
+	state := &core.State{
+		RunID:        runID,
+		Status:       core.StatusActive,
+		Workflow:     wf.Name,
+		Provider:     e.cfg.Workflow.Provider,
+		Task:         task,
+		CurrentStage: wf.Start,
+		Stages:       pendingStages(wf),
+		Iterations:   map[string]int{},
+	}
+	if err := e.store.CreateRun(state); err != nil {
+		return nil, err
+	}
+	e.emit(state, "", "", core.EventRunCreated, map[string]any{"workflow": wf.Name, "task": task})
+
+	// Persist the auditable run inputs.
+	if err := e.store.SaveWorkspace(runID, snap); err != nil {
+		return nil, err
+	}
+	pack, err := contextpack.Build(e.repo.Root(), e.cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := e.store.SaveContextPack(runID, []byte(pack.Markdown)); err != nil {
+		return nil, err
+	}
+	_ = e.snapshotConfig(runID)
+
+	// requireCleanTree policy.
+	if len(snap.DirtyFiles) > 0 {
+		switch e.cfg.Workspace.RequireCleanTree {
+		case "block":
+			e.block(state, fmt.Sprintf("working tree has %d uncommitted change(s); requireCleanTree=block", len(snap.DirtyFiles)))
+			return state, nil
+		case "warn":
+			e.emit(state, "", "", "dirty_tree_warning", map[string]any{"dirty_files": len(snap.DirtyFiles)})
+			e.log(i18n.T("engine.dirty_warning", len(snap.DirtyFiles)))
+		}
+	}
+
+	handle, err := e.store.AcquireLock(runID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = handle.Release() }()
+	hbCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go handle.StartHeartbeat(hbCtx)
+
+	rs := &runState{wf: wf, pack: pack.Markdown, baseSHA: snap.BaseSHA, startedAt: time.Now()}
+	return e.run(ctx, state, rs)
+}
+
+// ResumeOptions controls how a run is resumed.
+type ResumeOptions struct {
+	// AcceptChanges re-baselines the workspace snapshot when drift is detected,
+	// explicitly accepting external changes (e.g. the user fixed code by hand
+	// after a gate failure) instead of blocking.
+	AcceptChanges bool
+}
+
+// Resume continues an existing run, guarding against workspace drift.
+func (e *Engine) Resume(ctx context.Context, runID string, opts ResumeOptions) (*core.State, error) {
+	state, err := e.store.LoadState(runID)
+	if err != nil {
+		return nil, err
+	}
+	if state.Status.Terminal() {
+		return state, nil
+	}
+	wf, err := workflows.Get(state.Workflow)
+	if err != nil {
+		return nil, err
+	}
+
+	handle, err := e.store.AcquireLock(runID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = handle.Release() }()
+
+	snap, err := e.store.LoadWorkspace(runID)
+	if err != nil {
+		return nil, fmt.Errorf("loading workspace snapshot: %w", err)
+	}
+	if drifted, reason := e.checkDrift(runID, snap); drifted {
+		if !opts.AcceptChanges {
+			e.emit(state, "", "", core.EventWorkspaceDrift, map[string]any{"reason": reason})
+			e.block(state, "workspace_drift: "+reason)
+			e.log(i18n.T("engine.drift_hint", runID))
+			return state, nil
+		}
+		// Explicitly accepted: re-baseline the snapshot to the current tree.
+		fresh, err := e.repo.Snapshot(snap.Isolation)
+		if err != nil {
+			return nil, fmt.Errorf("re-baselining workspace: %w", err)
+		}
+		if err := e.store.SaveWorkspace(runID, fresh); err != nil {
+			return nil, err
+		}
+		snap = fresh
+		e.emit(state, "", "", "workspace_rebaselined", map[string]any{"reason": reason})
+		e.log(i18n.T("engine.rebaselined"))
+	}
+
+	hbCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go handle.StartHeartbeat(hbCtx)
+
+	state.Status = core.StatusActive
+	state.BlockedReason = ""
+	e.emit(state, state.CurrentStage, "", core.EventRunResumed, nil)
+
+	if state.Iterations == nil {
+		state.Iterations = map[string]int{}
+	}
+	rs := &runState{
+		wf:          wf,
+		pack:        e.store.ContextPack(runID),
+		baseSHA:     snap.BaseSHA,
+		lastSummary: e.lastSummaryOnDisk(wf, state),
+		startedAt:   time.Now(),
+		spentBefore: state.Budgets.WallClockSpentSeconds,
+	}
+	return e.run(ctx, state, rs)
+}
+
+// lastSummaryOnDisk restores prompt continuity across resumes: the summary of
+// the most recent completed stage, read back from summaries/<stage>.md.
+func (e *Engine) lastSummaryOnDisk(wf *workflows.Workflow, state *core.State) string {
+	last := ""
+	for _, st := range wf.Stages {
+		if state.Stages[st.Name] != core.StageDone {
+			continue
+		}
+		if md := e.store.StageSummary(state.RunID, st.Name); md != "" {
+			last = md
+		}
+	}
+	return last
+}
+
+// run is the shared stage loop used by both Start and Resume. Each iteration
+// either advances to the next stage or returns because the run reached a
+// terminal state (completed, blocked, failed, canceled).
+func (e *Engine) run(ctx context.Context, state *core.State, rs *runState) (*core.State, error) {
+	for {
+		if e.finalizeIfCanceled(state) || state.Status.Terminal() {
+			return state, nil
+		}
+		// Budgets are HARD limits: an over-budget run blocks here even if the
+		// only thing left is the terminal stage — it never completes over budget.
+		if e.budgetBlocked(state) {
+			return state, nil
+		}
+		stage, ok := rs.wf.Stage(state.CurrentStage)
+		if !ok {
+			e.fail(state, "unknown stage "+state.CurrentStage)
+			return state, nil
+		}
+		if stage.Kind == workflows.KindTerminal {
+			e.complete(state)
+			return state, nil
+		}
+		if e.stageIterationsBlocked(state, stage) {
+			return state, nil
+		}
+		if !e.executeStage(ctx, state, rs, stage) {
+			return state, nil // the stage reached a terminal state
+		}
+		e.advanceStage(state, stage)
+	}
+}
+
+// budgetBlocked blocks the run if a run-level budget is exhausted.
+func (e *Engine) budgetBlocked(state *core.State) bool {
+	reason := e.checkBudgets(state)
+	if reason == "" {
+		return false
+	}
+	e.emit(state, state.CurrentStage, "", core.EventBudgetExceeded, map[string]any{"reason": reason})
+	e.block(state, reason)
+	return true
+}
+
+// stageIterationsBlocked counts this entry into the stage and blocks if the
+// stage's iteration budget (re-entries via resume or future loops) is exceeded.
+func (e *Engine) stageIterationsBlocked(state *core.State, stage workflows.Stage) bool {
+	state.Iterations[stage.Name]++
+	sb, ok := e.cfg.Budgets.Stage[stage.Name]
+	if !ok || sb.MaxIterations <= 0 || state.Iterations[stage.Name] <= sb.MaxIterations {
+		return false
+	}
+	reason := fmt.Sprintf("stage %q exceeded its iteration budget (%d)", stage.Name, sb.MaxIterations)
+	e.emit(state, stage.Name, "", core.EventBudgetExceeded, map[string]any{"reason": reason})
+	e.block(state, reason)
+	return true
+}
+
+// executeStage runs one worker or gate stage under cancellation and budget
+// deadlines. It returns true only when the stage finished cleanly and the run
+// should advance; otherwise it has already set the terminal state.
+func (e *Engine) executeStage(ctx context.Context, state *core.State, rs *runState, stage workflows.Stage) bool {
+	state.Stages[stage.Name] = core.StageActive
+	state.Status = core.StatusActive
+	e.saveState(state)
+	e.emit(state, stage.Name, "", core.EventStageStarted, nil)
+	e.log(i18n.T("engine.stage", stage.Name))
+
+	// A watcher cancels the stage context — killing the worker or gate process —
+	// when `vichu cancel` marks the run canceled on disk; the budget deadline
+	// does the same when wall-clock runs out mid-stage.
+	stageCtx, stopWatch := e.watchCancel(ctx, state.RunID)
+	stageCtx, stopDeadline, deadlineReason := e.withBudgetDeadline(stageCtx, stage, rs)
+	if deadlineReason != "" {
+		stopDeadline()
+		stopWatch()
+		e.emit(state, stage.Name, "", core.EventBudgetExceeded, map[string]any{"reason": deadlineReason})
+		e.block(state, deadlineReason)
+		return false
+	}
+
+	advance, err := e.dispatchStage(stageCtx, state, rs, stage)
+	deadlineHit := stageCtx.Err() == context.DeadlineExceeded
+	stopDeadline()
+	stopWatch()
+
+	// Wall-clock spend updates after every stage, success or not.
+	state.Budgets.WallClockSpentSeconds = rs.wallClockSpent()
+
+	switch {
+	case e.finalizeIfCanceled(state):
+		return false
+	case deadlineHit || errors.Is(err, context.DeadlineExceeded):
+		reason := fmt.Sprintf("wall-clock budget exhausted during stage %q (%.0fs spent)", stage.Name, rs.wallClockSpent())
+		e.emit(state, stage.Name, "", core.EventBudgetExceeded, map[string]any{"reason": reason})
+		e.block(state, reason)
+		return false
+	case err != nil:
+		e.fail(state, err.Error())
+		return false
+	default:
+		return advance // false here means the stage already blocked the run
+	}
+}
+
+// dispatchStage runs the stage body appropriate to its kind.
+func (e *Engine) dispatchStage(ctx context.Context, state *core.State, rs *runState, stage workflows.Stage) (bool, error) {
+	switch stage.Kind {
+	case workflows.KindWorker:
+		return e.runWorkerStage(ctx, state, rs, stage)
+	case workflows.KindGate:
+		return e.runGateStage(ctx, state, rs, stage)
+	default:
+		return true, nil
+	}
+}
+
+// advanceStage records a stage as done and transitions to the next.
+func (e *Engine) advanceStage(state *core.State, stage workflows.Stage) {
+	state.Stages[stage.Name] = core.StageDone
+	e.saveState(state)
+	e.emit(state, stage.Name, "", core.EventStageCompleted, nil)
+	e.emit(state, "", "", core.EventStageTransition, map[string]any{"from": stage.Name, "to": stage.Next})
+	state.CurrentStage = stage.Next
+	e.saveState(state)
+}
+
+// withBudgetDeadline derives the stage context's deadline from the remaining
+// run wall-clock budget and the stage's own MaxWallClock, whichever is sooner.
+// A non-empty reason means the budget is already exhausted.
+func (e *Engine) withBudgetDeadline(ctx context.Context, stage workflows.Stage, rs *runState) (context.Context, context.CancelFunc, string) {
+	noop := context.CancelFunc(func() {
+		// no-op cancel: returned when no budget deadline applies.
+	})
+	var deadline time.Time
+
+	if b := e.cfg.Budgets.Run.MaxWallClock; b > 0 {
+		remaining := b.Std() - time.Duration(rs.wallClockSpent()*float64(time.Second))
+		if remaining <= 0 {
+			return ctx, noop, fmt.Sprintf("wall-clock budget exhausted (%s)", b.Std())
+		}
+		deadline = time.Now().Add(remaining)
+	}
+	if sb, ok := e.cfg.Budgets.Stage[stage.Name]; ok && sb.MaxWallClock > 0 {
+		stageDeadline := time.Now().Add(sb.MaxWallClock.Std())
+		if deadline.IsZero() || stageDeadline.Before(deadline) {
+			deadline = stageDeadline
+		}
+	}
+	if deadline.IsZero() {
+		return ctx, noop, ""
+	}
+	dctx, cancel := context.WithDeadline(ctx, deadline)
+	return dctx, cancel, ""
+}
+
+// saveState persists state but never clobbers a terminal status written
+// externally (e.g. `vichu cancel` from another process). If the run is already
+// terminal on disk, the in-memory state adopts it instead.
+func (e *Engine) saveState(state *core.State) {
+	if disk, err := e.store.LoadState(state.RunID); err == nil &&
+		disk.Status.Terminal() && !state.Status.Terminal() {
+		*state = *disk
+		return
+	}
+	_ = e.store.SaveState(state)
+}
+
+// canceledOnDisk reports whether another process marked the run canceled.
+func (e *Engine) canceledOnDisk(runID string) bool {
+	disk, err := e.store.LoadState(runID)
+	return err == nil && disk.Status == core.StatusCanceled
+}
+
+// finalizeIfCanceled adopts an external cancellation: clears transient fields
+// and stops the loop without overwriting the canceled status.
+func (e *Engine) finalizeIfCanceled(state *core.State) bool {
+	if !e.canceledOnDisk(state.RunID) {
+		return false
+	}
+	state.Status = core.StatusCanceled
+	state.ActiveWorker = ""
+	state.NextAction = ""
+	_ = e.store.SaveState(state)
+	e.log(i18n.T("engine.canceled"))
+	return true
+}
+
+// watchCancel derives a context that is canceled when the run is marked
+// canceled on disk, so in-flight worker and gate processes are killed instead
+// of running to completion.
+func (e *Engine) watchCancel(ctx context.Context, runID string) (context.Context, context.CancelFunc) {
+	wctx, cancel := context.WithCancel(ctx)
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-wctx.Done():
+				return
+			case <-t.C:
+				if e.canceledOnDisk(runID) {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return wctx, cancel
+}
+
+func (e *Engine) complete(state *core.State) {
+	if e.finalizeIfCanceled(state) {
+		return
+	}
+	state.Status = core.StatusCompleted
+	state.CurrentStage = "done"
+	state.ActiveWorker = ""
+	state.NextAction = ""
+	if state.Stages != nil {
+		state.Stages["done"] = core.StageDone
+	}
+	_ = e.store.SaveState(state)
+	e.emit(state, "", "", core.EventRunCompleted, nil)
+	e.log(i18n.T("engine.completed"))
+}
+
+func (e *Engine) block(state *core.State, reason string) {
+	if e.finalizeIfCanceled(state) {
+		return
+	}
+	state.Status = core.StatusBlocked
+	state.BlockedReason = reason
+	// No worker is active once the run is blocked — clear the transient before
+	// setting the resolution hint, so the observable state never points at a
+	// worker that already finished, failed, or was canceled.
+	state.ActiveWorker = ""
+	state.NextAction = "resolve and `vichu resume " + state.RunID + "`"
+	_ = e.store.SaveState(state)
+	e.emit(state, state.CurrentStage, "", core.EventRunBlocked, map[string]any{"reason": reason})
+	e.log(i18n.T("engine.blocked", reason))
+}
+
+func (e *Engine) fail(state *core.State, reason string) {
+	if e.finalizeIfCanceled(state) {
+		return
+	}
+	state.Status = core.StatusFailed
+	state.BlockedReason = reason
+	state.ActiveWorker = ""
+	state.NextAction = ""
+	_ = e.store.SaveState(state)
+	e.emit(state, state.CurrentStage, "", core.EventRunFailed, map[string]any{"reason": reason})
+	e.log(i18n.T("engine.failed", reason))
+}
+
+// emit appends a normalized event to the run's timeline.
+func (e *Engine) emit(state *core.State, stage, worker, event string, detail map[string]any) {
+	_ = e.store.AppendEvent(core.Event{
+		Run:    state.RunID,
+		Stage:  stage,
+		Worker: worker,
+		Event:  event,
+		Detail: detail,
+	})
+}
+
+func (e *Engine) snapshotConfig(runID string) error {
+	return e.cfg.Save(e.store.ConfigSnapshotPath(runID))
+}
+
+func pendingStages(wf *workflows.Workflow) map[string]core.StageStatus {
+	m := map[string]core.StageStatus{}
+	for _, name := range wf.StageNames() {
+		m[name] = core.StagePending
+	}
+	return m
+}

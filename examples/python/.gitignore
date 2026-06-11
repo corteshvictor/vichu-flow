@@ -1,0 +1,7 @@
+# Python artifacts (the gate runs with -B, so these shouldn't appear; ignored
+# as a safety net if you run tests another way).
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

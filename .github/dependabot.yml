@@ -1,0 +1,19 @@
+# Automated dependency updates + security alerts.
+# https://docs.github.com/code-security/dependabot
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # Prefix becomes the PR title, which pr-title.yml lints against Conventional
+    # Commits. `build(deps)` is a valid type+scope; a bare `deps:` would fail.
+    commit-message:
+      prefix: "build(deps)"
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci(deps)"

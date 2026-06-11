@@ -1,0 +1,31 @@
+name: pr-title
+
+# Enforces Conventional Commits on the PR title. With squash-merge (the project
+# default), the PR title becomes the commit message on main, which is what
+# release-please reads to compute the version and changelog. A self-contained
+# regex check keeps this dependency-free (no third-party action).
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          # type(optional scope)(optional !): subject
+          pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9 ._-]+\))?!?: .+'
+          if echo "$TITLE" | grep -qE "$pattern"; then
+            echo "OK: \"$TITLE\""
+          else
+            echo "::error::PR title must follow Conventional Commits, e.g. 'feat(engine): add fix loop'."
+            echo "Got: \"$TITLE\""
+            echo "Allowed types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert."
+            exit 1
+          fi

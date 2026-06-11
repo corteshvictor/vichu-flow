@@ -1,0 +1,19 @@
+# VichuFlow config for a Go project. The gate is `go test ./...`.
+project:
+  name: vichu-example-go
+  language: go
+
+ui:
+  language: en
+
+workflow:
+  default: quick
+
+agents:
+  default:
+    provider: fake   # swap to claude-code to use a real agent
+
+commands:
+  test: go test ./...
+  lint: go vet ./...
+  typecheck: go build ./...

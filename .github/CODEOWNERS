@@ -1,0 +1,7 @@
+# Designates the code owner(s). Today the `protect-main` ruleset does NOT require
+# approvals (solo maintainer), so this is staged for later: when there's a team,
+# enable "Require review from Code Owners" on the ruleset and every PR will then
+# need the owner's approval before merge.
+#
+# Replace with your real GitHub handle / team if it differs.
+* @corteshvictor

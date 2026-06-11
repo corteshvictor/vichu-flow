@@ -1,0 +1,25 @@
+# VichuFlow config for a Python project. The gate is `python3 -B -m unittest` —
+# Python's built-in test runner. The `-B` flag tells Python NOT to write
+# bytecode (`__pycache__`), so the gate never mutates the tree (gates must only
+# verify, not change files). It needs only Python: no pip install, no deps.
+#
+# Many Python projects prefer pytest; if so, install it and use  test: pytest .
+# VichuFlow runs whatever command you put here.
+project:
+  name: vichu-example-python
+  language: python
+
+ui:
+  language: en
+
+workflow:
+  default: quick
+
+agents:
+  default:
+    provider: fake   # swap to claude-code to use a real agent
+
+commands:
+  test: python3 -B -m unittest
+  lint: auto
+  typecheck: auto

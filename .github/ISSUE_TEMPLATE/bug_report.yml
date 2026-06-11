@@ -1,0 +1,38 @@
+name: Bug report
+description: Something doesn't work as expected
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands. Include the relevant `vichu.yaml` if it matters.
+      placeholder: |
+        1. vichu init
+        2. vichu run "..."
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Output of `vichu version` and `vichu doctor`, plus your OS.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant runtime files
+      description: |
+        If you can share them, the run's `state.json` and the tail of
+        `events.ndjson` from `.vichu/runs/<run-id>/` are very helpful. Redact any
+        sensitive content first.
+      render: shell

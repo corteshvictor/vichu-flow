@@ -1,0 +1,25 @@
+# VichuFlow config for a Node project. The gate is `node --test` — Node's
+# built-in test runner. It needs ONLY Node: no npm, no pnpm, no install step, no
+# dependencies, no node_modules. That keeps this template maximally portable.
+#
+# A real project usually runs tests through its package manager instead — just
+# point the gate at that, e.g.  test: pnpm test  (with a "test" script in
+# package.json). VichuFlow runs whatever command you put here.
+project:
+  name: vichu-example-node
+  language: javascript
+
+ui:
+  language: en
+
+workflow:
+  default: quick
+
+agents:
+  default:
+    provider: fake   # swap to claude-code to use a real agent
+
+commands:
+  test: node --test
+  lint: auto
+  typecheck: auto

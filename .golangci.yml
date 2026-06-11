@@ -1,0 +1,46 @@
+version: "2"
+linters:
+  enable:
+    - gocognit
+    - gocyclo
+    - misspell
+    - revive
+    - unconvert
+    - whitespace
+  settings:
+    gocognit:
+      min-complexity: 30
+    gocyclo:
+      min-complexity: 25
+    misspell:
+      locale: US
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - errcheck
+          - gocognit
+          - gocyclo
+        path: _test\.go
+      - linters:
+          - misspell
+        path: internal/i18n/catalog\.go
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+formatters:
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

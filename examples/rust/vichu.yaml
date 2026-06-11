@@ -1,0 +1,19 @@
+# VichuFlow config for a Rust project. The gate is `cargo test`.
+project:
+  name: vichu-example-rust
+  language: rust
+
+ui:
+  language: en
+
+workflow:
+  default: quick
+
+agents:
+  default:
+    provider: fake   # swap to claude-code to use a real agent
+
+commands:
+  test: cargo test
+  lint: cargo clippy
+  typecheck: cargo check

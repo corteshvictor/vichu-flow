@@ -1,0 +1,68 @@
+# https://taskfile.dev — cross-platform task runner for VichuFlow.
+version: "3"
+
+vars:
+  BINARY: vichu
+  PKG: ./cmd/vichu
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  tidy:
+    desc: Sync go.mod/go.sum
+    cmds:
+      - go mod tidy
+
+  build:
+    desc: Build the vichu binary
+    cmds:
+      - go build -o {{.BINARY}} {{.PKG}}
+
+  test:
+    desc: Run all tests
+    cmds:
+      - go test ./...
+
+  test:race:
+    desc: Run all tests with the race detector
+    cmds:
+      - go test -race ./...
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  lint:
+    desc: Run golangci-lint (pinned version via go run — needs only Go, no separate install)
+    cmds:
+      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run
+
+  vuln:
+    desc: Scan for known vulnerabilities in code and dependencies
+    cmds:
+      - go mod verify
+      - go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...
+
+  fmt:
+    desc: Format all Go code
+    cmds:
+      - gofmt -w .
+
+  check:
+    desc: Format check, vet, test, lint, and vuln scan (full local gate)
+    cmds:
+      - test -z "$(gofmt -l .)"
+      - go vet ./...
+      - go test -race ./...
+      - task: lint
+      - task: vuln
+
+  run:
+    desc: Build and run vichu (pass args after --)
+    cmds:
+      - go run {{.PKG}} {{.CLI_ARGS}}
