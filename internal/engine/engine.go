@@ -121,7 +121,7 @@ func (e *Engine) Start(ctx context.Context, task, workflowName string) (*core.St
 	if err := e.store.SaveContextPack(runID, []byte(pack.Markdown)); err != nil {
 		return nil, err
 	}
-	_ = e.snapshotConfig(runID)
+	e.warn(e.snapshotConfig(runID), "save config snapshot")
 
 	// requireCleanTree policy.
 	if len(snap.DirtyFiles) > 0 {
@@ -401,7 +401,17 @@ func (e *Engine) saveState(state *core.State) {
 		*state = *disk
 		return
 	}
-	_ = e.store.SaveState(state)
+	e.warn(e.store.SaveState(state), "persist run state")
+}
+
+// warn surfaces a non-fatal persistence/evidence failure through the log so it
+// is never silent. A failed audit write means the run's evidence is incomplete,
+// but does not by itself stop the run; the safety-critical paths (mutation
+// tracking and gate backup) block the run instead of degrading quietly.
+func (e *Engine) warn(err error, what string) {
+	if err != nil {
+		e.log(fmt.Sprintf("warning: could not %s: %v", what, err))
+	}
 }
 
 // canceledOnDisk reports whether another process marked the run canceled.
@@ -419,7 +429,7 @@ func (e *Engine) finalizeIfCanceled(state *core.State) bool {
 	state.Status = core.StatusCanceled
 	state.ActiveWorker = ""
 	state.NextAction = ""
-	_ = e.store.SaveState(state)
+	e.warn(e.store.SaveState(state), "persist canceled state")
 	e.log(i18n.T("engine.canceled"))
 	return true
 }
@@ -458,7 +468,7 @@ func (e *Engine) complete(state *core.State) {
 	if state.Stages != nil {
 		state.Stages["done"] = core.StageDone
 	}
-	_ = e.store.SaveState(state)
+	e.warn(e.store.SaveState(state), "persist completed state")
 	e.emit(state, "", "", core.EventRunCompleted, nil)
 	e.log(i18n.T("engine.completed"))
 }
@@ -474,7 +484,7 @@ func (e *Engine) block(state *core.State, reason string) {
 	// worker that already finished, failed, or was canceled.
 	state.ActiveWorker = ""
 	state.NextAction = "resolve and `vichu resume " + state.RunID + "`"
-	_ = e.store.SaveState(state)
+	e.warn(e.store.SaveState(state), "persist blocked state")
 	e.emit(state, state.CurrentStage, "", core.EventRunBlocked, map[string]any{"reason": reason})
 	e.log(i18n.T("engine.blocked", reason))
 }
@@ -487,20 +497,20 @@ func (e *Engine) fail(state *core.State, reason string) {
 	state.BlockedReason = reason
 	state.ActiveWorker = ""
 	state.NextAction = ""
-	_ = e.store.SaveState(state)
+	e.warn(e.store.SaveState(state), "persist failed state")
 	e.emit(state, state.CurrentStage, "", core.EventRunFailed, map[string]any{"reason": reason})
 	e.log(i18n.T("engine.failed", reason))
 }
 
 // emit appends a normalized event to the run's timeline.
 func (e *Engine) emit(state *core.State, stage, worker, event string, detail map[string]any) {
-	_ = e.store.AppendEvent(core.Event{
+	e.warn(e.store.AppendEvent(core.Event{
 		Run:    state.RunID,
 		Stage:  stage,
 		Worker: worker,
 		Event:  event,
 		Detail: detail,
-	})
+	}), "record event "+event)
 }
 
 func (e *Engine) snapshotConfig(runID string) error {

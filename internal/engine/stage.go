@@ -55,19 +55,26 @@ func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runS
 		}
 	}
 
+	// Start mutation tracking BEFORE the worker runs — refuse to run an agent we
+	// cannot audit. Without tracking there is no mutations.json, and the
+	// read-only / scope / sensitive-file policy checks would silently not apply.
+	tracker, err := e.repo.BeginTracking()
+	if err != nil {
+		e.block(state, fmt.Sprintf("cannot track worker mutations: %v — refusing to run an agent without an audit trail", err))
+		return false, nil
+	}
+
 	now := time.Now().UTC()
 	ws := &core.WorkerStatus{
 		ID: workerID, Role: stage.Role, Adapter: adapter.Name(),
 		Stage: stage.Name, Status: core.WorkerRunning, StartedAt: now,
 	}
-	_ = e.store.SaveWorkerStatus(state.RunID, ws)
-	_ = e.store.WriteWorkerFile(state.RunID, workerID, "prompt.md", []byte(prompt))
+	e.warn(e.store.SaveWorkerStatus(state.RunID, ws), "save worker status")
+	e.warn(e.store.WriteWorkerFile(state.RunID, workerID, "prompt.md", []byte(prompt)), "write worker prompt")
 	state.ActiveWorker = workerID
 	state.NextAction = "running " + stage.Role
 	e.saveState(state)
 	e.emit(state, stage.Name, workerID, core.EventWorkerStarted, map[string]any{"adapter": adapter.Name(), "role": stage.Role})
-
-	tracker, _ := e.repo.BeginTracking()
 
 	sess, err := adapter.Start(ctx, inv)
 	if err != nil {
@@ -108,7 +115,7 @@ func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runS
 	ws.Status = core.WorkerDone
 	ws.FinishedAt = &fin
 	ws.SessionID = result.SessionID
-	_ = e.store.SaveWorkerStatus(state.RunID, ws)
+	e.warn(e.store.SaveWorkerStatus(state.RunID, ws), "save worker status")
 	e.emit(state, stage.Name, workerID, core.EventWorkerFinished, map[string]any{"cost_usd": result.CostUSD})
 	if result.TokensIn > 0 || result.TokensOut > 0 {
 		e.emit(state, stage.Name, workerID, "token_usage", map[string]any{
@@ -118,7 +125,7 @@ func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runS
 	}
 
 	rs.lastSummary = truncate(result.Markdown, 2000)
-	_ = e.store.SaveStageSummary(state.RunID, stage.Name, []byte(rs.lastSummary))
+	e.warn(e.store.SaveStageSummary(state.RunID, stage.Name, []byte(rs.lastSummary)), "save stage summary")
 	state.ActiveWorker = ""
 	e.saveState(state)
 
@@ -173,11 +180,27 @@ func (e *Engine) runGate(ctx context.Context, state *core.State, stage workflows
 	// tree. This is the backstop for gates that mutate via an interpreter the
 	// policy can't introspect (e.g. `python -c '...'`). In block mode we also
 	// back up at-risk user work first, so the gate's damage can be rolled back.
+	// Set up the gate-mutation backstop BEFORE running the gate, and refuse to run
+	// if it can't be established: without a backup (block mode) a damaging gate
+	// could not be rolled back, and without tracking the backstop can't detect it.
 	var backup *workspace.Backup
-	if e.cfg.Security.GateMutations == "block" {
-		backup, _ = e.repo.BackupChanged()
+	var tracker *workspace.Tracker
+	if e.cfg.Security.GateMutations != "allow" {
+		if e.cfg.Security.GateMutations == "block" {
+			b, err := e.repo.BackupChanged()
+			if err != nil {
+				e.block(state, fmt.Sprintf("cannot back up the working tree before gate %q: %v", name, err))
+				return false, nil
+			}
+			backup = b
+		}
+		t, err := e.repo.BeginTracking()
+		if err != nil {
+			e.block(state, fmt.Sprintf("cannot track gate %q mutations: %v", name, err))
+			return false, nil
+		}
+		tracker = t
 	}
-	tracker, _ := e.repo.BeginTracking()
 	v, err := e.gates.Run(ctx, state.RunID, stage.Name, n, spec)
 	if err != nil {
 		return false, err
@@ -248,7 +271,7 @@ func (e *Engine) recordGateExcerpt(state *core.State, stage, name string, n int,
 	if err != nil {
 		return
 	}
-	_ = e.store.SaveGateExcerpt(state.RunID, stage, n, []byte(text))
+	e.warn(e.store.SaveGateExcerpt(state.RunID, stage, n, []byte(text)), "save gate excerpt")
 	if truncated {
 		e.emit(state, stage, "", core.EventOutputTruncated, map[string]any{
 			"gate": name, "full_bytes": v.OutputBytes, "excerpt_bytes": maxBytes,
@@ -265,7 +288,10 @@ func (e *Engine) trackMutations(state *core.State, stage workflows.Stage, worker
 	}
 	muts, err := tracker.Finish()
 	if err != nil {
-		return ""
+		// Cannot finalize the mutation audit: we no longer know what the worker
+		// changed, so the read-only / scope / sensitive-file policy can't be
+		// applied. Block rather than proceed without evidence.
+		return fmt.Sprintf("cannot finalize mutation audit for worker %s: %v", workerID, err)
 	}
 	for i := range muts {
 		if !workspace.InScope(muts[i].Path, stage.Scope) {
@@ -276,7 +302,7 @@ func (e *Engine) trackMutations(state *core.State, stage workflows.Stage, worker
 		Worker: workerID, Stage: stage.Name, BaseSHA: baseSHA,
 		Mutations: muts, CapturedAt: time.Now().UTC(),
 	}
-	_ = e.store.SaveMutationReport(state.RunID, workerID, report)
+	e.warn(e.store.SaveMutationReport(state.RunID, workerID, report), "save mutation report")
 	e.emit(state, stage.Name, workerID, core.EventMutationTracked, map[string]any{"count": len(muts)})
 	for _, m := range muts {
 		if m.OutOfScope {
@@ -300,14 +326,18 @@ func (e *Engine) checkGateMutations(state *core.State, stage string, n int, trac
 		return "", nil
 	}
 	muts, err := tracker.Finish()
-	if err != nil || len(muts) == 0 {
+	if err != nil {
+		// Cannot tell whether the gate mutated the tree — never treat it as safe.
+		return fmt.Sprintf("cannot verify gate %q mutations (run %d): %v", stage, n, err), nil
+	}
+	if len(muts) == 0 {
 		return "", nil
 	}
 	report := &core.MutationReport{
 		Worker: fmt.Sprintf("gate:%s:%d", stage, n), Stage: stage,
 		BaseSHA: e.repo.HeadSHA(), Mutations: muts, CapturedAt: time.Now().UTC(),
 	}
-	_ = e.store.SaveGateMutationReport(state.RunID, stage, n, report)
+	e.warn(e.store.SaveGateMutationReport(state.RunID, stage, n, report), "save gate mutation report")
 	e.emit(state, stage, "", "gate_mutation", map[string]any{"gate_n": n, "count": len(muts)})
 
 	if e.cfg.Security.GateMutations == "warn" {
@@ -349,14 +379,14 @@ func mutationPolicyVerdict(stage workflows.Stage, muts []core.Mutation, sec conf
 }
 
 func (e *Engine) persistWorkerResult(runID, workerID string, result core.Result) {
-	_ = e.store.WriteWorkerFile(runID, workerID, "result.md", []byte(result.Markdown))
+	e.warn(e.store.WriteWorkerFile(runID, workerID, "result.md", []byte(result.Markdown)), "write worker result")
 	if data, err := json.MarshalIndent(result, "", "  "); err == nil {
-		_ = e.store.WriteWorkerFile(runID, workerID, "result.json", append(data, '\n'))
+		e.warn(e.store.WriteWorkerFile(runID, workerID, "result.json", append(data, '\n')), "write worker result json")
 	}
 	if result.SessionID != "" {
 		session := map[string]string{"session_id": result.SessionID}
 		if data, err := json.MarshalIndent(session, "", "  "); err == nil {
-			_ = e.store.WriteWorkerFile(runID, workerID, "session.json", append(data, '\n'))
+			e.warn(e.store.WriteWorkerFile(runID, workerID, "session.json", append(data, '\n')), "write worker session")
 		}
 	}
 }
@@ -369,7 +399,7 @@ func (e *Engine) markWorker(state *core.State, ws *core.WorkerStatus, status cor
 	fin := time.Now().UTC()
 	ws.Status = status
 	ws.FinishedAt = &fin
-	_ = e.store.SaveWorkerStatus(state.RunID, ws)
+	e.warn(e.store.SaveWorkerStatus(state.RunID, ws), "save worker status")
 }
 
 // checkBudgets returns a non-empty reason if a run-level budget is exhausted.
