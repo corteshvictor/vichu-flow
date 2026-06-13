@@ -14,10 +14,9 @@ agents from the outside, and **decides stage transitions from evidence it
 verifies itself** — running your tests, lint, and typecheck — never from the
 agent's own say-so.
 
-> **Adapter status:** the v0.1 release ships the `claude-code`, `shell`, and
-> `fake` adapters; the `codex` adapter is on `main` for v0.2. More agents
-> (OpenCode, Gemini CLI) are designed for through the same contract and land on
-> the roadmap.
+> **Adapter status:** v0.2 ships the `claude-code`, `codex`, `shell`, and `fake`
+> adapters. More agents (OpenCode, Gemini CLI) are designed for through the same
+> contract and land on the roadmap.
 
 ## Why VichuFlow?
 
@@ -56,18 +55,18 @@ Three ideas hold it together:
 
 ## Status
 
-**Current release: v0.1.1.** It ships:
+**Current release: v0.2.0.** It ships:
 
 - `vichu init`, `doctor`, `run`, `status [--watch]`, `resume`, `cancel`, `adapters`, `config`
 - Persistent runtime: atomic `state.json`, append-only `events.ndjson`, heartbeat locks with orphan reclaim, cooperative cancel
-- `quick` workflow (explore → implement → verify)
-- Adapters: **`claude-code`** (headless, streamed events, session resume), `shell`, and `fake` (deterministic, for CI)
+- `quick` workflow (explore → implement → verify) and **`review`** workflow (an adversarial review → auto-fix loop that branches on a structured, persisted verdict)
+- Adapters: **`claude-code`** and **`codex`** (headless, streamed events, session resume), `shell`, and `fake` (deterministic, for CI)
 - Verified gates, git workspace snapshots with content fingerprints, per-worker mutation tracking, and enforced mutation policy (sensitive files block, read-only stages enforced)
-- Git is required (agents writing code without version control have no undo)
 
-**Unreleased (v0.2, on `main`):** the `review` workflow (an adversarial review →
-auto-fix loop, bounded by a per-loop iteration budget) and the **`codex`**
-adapter. These are not in the v0.1.x release yet.
+> **Current limitation:** v0.2 works on **Git-backed** repositories — change
+> detection, diffs, and rollback use Git, so a project needs to be a Git repo.
+> Filesystem-only workspaces (running in any folder, no Git required) land in
+> **v0.3** via `workspace.provider: auto | git | filesystem`.
 
 The architecture is documented in [Concepts](docs/user/concepts.md) and the
 [runtime format](docs/user/runtime-format.md).

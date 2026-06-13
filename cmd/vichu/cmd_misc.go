@@ -36,7 +36,7 @@ func cmdResume(args []string) error {
 	}
 	fmt.Println()
 	printStateSummary(state)
-	return nil
+	return runStatusError(state)
 }
 
 func cmdCancel(args []string) error {

@@ -158,6 +158,46 @@ func TestReviewPerStageBudgetOverridesDefault(t *testing.T) {
 	}
 }
 
+// TestReviewStageTokenBudgetStopsLoop: a per-stage token budget caps the
+// CUMULATIVE token spend of the review loop — a reviewer that keeps asking for
+// fixes (and burning tokens) is stopped once the stage's budget is spent, even
+// if the iteration budget is generous.
+func TestReviewStageTokenBudgetStopsLoop(t *testing.T) {
+	dir := newTestRepo(t)
+	store := rt.Open(dir)
+	repo, err := workspace.Detect(dir)
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	cfg := config.Default()
+	cfg.Workspace.RequireCleanTree = "allow"
+	cfg.Workflow.MaxAutoIterations = 10 // generous — NOT the binding limit
+	cfg.Budgets.Stage = map[string]config.StageBudget{"review": {MaxTotalTokens: 200}}
+
+	script := adapters.FakeScript{
+		TokensIn:  100, // 150 tokens per review call
+		TokensOut: 50,
+		Actions: map[string][]adapters.FakeAction{
+			"implementer": {{Type: "write_file", Path: "src/feature.txt", Content: "feature\n"}},
+		},
+		Verdicts: map[string][]adapters.FakeVerdict{"reviewer": {{Status: "needs_fixes", Summary: "again"}}},
+	}
+	reg := adapters.NewRegistry()
+	reg.Register(adapters.FakeName, func() (adapters.Adapter, error) { return adapters.NewFake(script), nil })
+	e := New(Options{Store: store, Registry: reg, Config: cfg, Repo: repo})
+
+	state, err := e.Start(context.Background(), "task", "review")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if state.Status != core.StatusBlocked || !strings.Contains(state.BlockedReason, "token budget") {
+		t.Fatalf("review loop must stop on the stage token budget, got %s (%s)", state.Status, state.BlockedReason)
+	}
+	if state.Budgets.StageTokensTotal("review") < 200 {
+		t.Fatalf("review stage tokens should have accumulated past the budget, got %d", state.Budgets.StageTokensTotal("review"))
+	}
+}
+
 // TestReviewInvalidVerdictBlocks: a verdict with an unknown status must block the
 // run — it must NEVER fall through to approved.
 func TestReviewInvalidVerdictBlocks(t *testing.T) {
@@ -277,6 +317,82 @@ func TestReviewBranchStrictOnMissingVerdict(t *testing.T) {
 	if branch, ok := e.reviewBranch(state, stage); !ok || branch != "verify" {
 		t.Fatalf("approved verdict must branch to verify, got %q ok=%v", branch, ok)
 	}
+}
+
+// TestReviewDiffOnlyPromptCarriesChanges: by default (diff-only), the reviewer's
+// prompt carries the changed files and their content — so it judges the change
+// without re-reading the whole repo (the token win).
+func TestReviewDiffOnlyPromptCarriesChanges(t *testing.T) {
+	dir := newTestRepo(t)
+	e, store := reviewEngine(t, dir, []adapters.FakeVerdict{{Status: "approved", Summary: "ok"}})
+
+	state, err := e.Start(context.Background(), "add a feature", "review")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if state.Status != core.StatusCompleted {
+		t.Fatalf("want completed, got %s (%s)", state.Status, state.BlockedReason)
+	}
+
+	prompt := readStagePrompt(t, store, state.RunID, "review")
+	if !strings.Contains(prompt, "Changes to review") {
+		t.Fatal("diff-only review prompt should include a 'Changes to review' section")
+	}
+	if !strings.Contains(prompt, "src/feature.txt") || !strings.Contains(prompt, "feature") {
+		t.Fatalf("review prompt should include the changed file and its content, got:\n%s", prompt)
+	}
+}
+
+// TestReviewContextTruncationIsRecorded: when the change set is truncated/omitted
+// for the context budget, the timeline records it — a reviewer judging on
+// incomplete context is never a silent fact.
+func TestReviewContextTruncationIsRecorded(t *testing.T) {
+	dir := newTestRepo(t)
+	store := rt.Open(dir)
+	repo, err := workspace.Detect(dir)
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	cfg := config.Default()
+	cfg.Workspace.RequireCleanTree = "allow"
+
+	big := strings.Repeat("x", 20*1024) // over the per-file review-context budget
+	script := adapters.FakeScript{
+		Actions: map[string][]adapters.FakeAction{
+			"implementer": {{Type: "write_file", Path: "src/big.txt", Content: big}},
+		},
+		Verdicts: map[string][]adapters.FakeVerdict{"reviewer": {{Status: "approved"}}},
+	}
+	reg := adapters.NewRegistry()
+	reg.Register(adapters.FakeName, func() (adapters.Adapter, error) { return adapters.NewFake(script), nil })
+	e := New(Options{Store: store, Registry: reg, Config: cfg, Repo: repo})
+
+	state, err := e.Start(context.Background(), "task", "review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, _ := store.ReadEvents(state.RunID)
+	if !hasEvent(events, core.EventReviewContextTruncated) {
+		t.Fatalf("review-context truncation must be recorded (status %s)", state.Status)
+	}
+}
+
+// readStagePrompt returns the prompt.md of the (latest) worker for a stage.
+func readStagePrompt(t *testing.T, store *rt.Store, runID, stage string) string {
+	t.Helper()
+	workers, _ := store.ListWorkers(runID)
+	found := ""
+	for _, w := range workers {
+		ws, err := store.LoadWorkerStatus(runID, w)
+		if err != nil || ws.Stage != stage {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(store.WorkerDir(runID, w), "prompt.md"))
+		if err == nil {
+			found = string(data)
+		}
+	}
+	return found
 }
 
 func countEvent(events []core.Event, name string) int {

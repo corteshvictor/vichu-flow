@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/corteshvictor/vichu-flow/internal/adapters"
@@ -38,6 +39,14 @@ func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runS
 		return false, nil
 	}
 
+	// Per-stage token budget: if this stage already burned its token cap across
+	// previous iterations (e.g. a review→fix loop), stop before spending more.
+	if reason := e.stageTokenBudgetExceeded(state, stage); reason != "" {
+		e.emit(state, stage.Name, "", core.EventBudgetExceeded, map[string]any{"reason": reason})
+		e.block(state, reason)
+		return false, nil
+	}
+
 	agentCfg := e.cfg.Agent(stage.Role)
 	adapter, err := e.registry.Get(agentCfg.Provider)
 	if err != nil {
@@ -47,6 +56,9 @@ func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runS
 	state.Budgets.AgentInvocations++
 	workerID := fmt.Sprintf("%s-%02d", stage.Name, state.Budgets.AgentInvocations)
 	prompt := buildPrompt(rs.pack, stage.Instruction, state.Task, rs.lastSummary, e.cfg)
+	// A review stage gets the change set inline (diff-only) so it judges the work
+	// without re-reading the whole repo — fewer tokens, less free exploration.
+	prompt = e.withReviewContext(prompt, state, stage.Name, stage.Kind == workflows.KindReview)
 
 	inv := adapters.Invocation{
 		Role:             stage.Role,
@@ -55,6 +67,7 @@ func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runS
 		Model:            agentCfg.Model,
 		Effort:           agentCfg.Effort,
 		Iteration:        state.Iterations[stage.Name],
+		ReadOnly:         stage.ReadOnly,
 		AllowNonZeroExit: agentCfg.AllowNonZeroExit,
 		DisallowedTools:  e.policy.ClaudeDisallowedTools(),
 	}
@@ -116,6 +129,7 @@ func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runS
 	state.Budgets.TokensInSpent += result.TokensIn
 	state.Budgets.TokensOutSpent += result.TokensOut
 	state.Budgets.WallClockSpentSeconds = rs.wallClockSpent()
+	addStageTokens(state, stage.Name, result.TokensIn, result.TokensOut)
 	if result.TokensIn > 0 || result.TokensOut > 0 {
 		e.emit(state, stage.Name, workerID, "token_usage", map[string]any{
 			"tokens_in": result.TokensIn, "tokens_out": result.TokensOut,
@@ -224,6 +238,15 @@ func (e *Engine) runGateStage(ctx context.Context, state *core.State, _ *runStat
 		}
 	}
 	if ran == 0 {
+		// The stage WANTED verification (it declares gates) but none were
+		// configured. With requireGates on, refuse to report a "completed" run that
+		// verified nothing; otherwise warn loudly and continue (demo/fake friendly).
+		if len(stage.Gates) > 0 && e.cfg.Workflow.GatesRequired() {
+			reason := fmt.Sprintf("stage %q has no verification gates configured — nothing was verified (set commands.%s in vichu.yaml, or workflow.requireGates: false)", stage.Name, strings.Join(stage.Gates, "/"))
+			e.emit(state, stage.Name, "", "no_gates_configured", map[string]any{"required": true})
+			e.block(state, reason)
+			return false, nil
+		}
 		e.emit(state, stage.Name, "", "no_gates_configured", nil)
 		e.log(i18n.T("engine.no_gates"))
 	}
@@ -484,6 +507,45 @@ func (e *Engine) markWorker(state *core.State, ws *core.WorkerStatus, status cor
 	ws.Status = status
 	ws.FinishedAt = &fin
 	e.warn(e.store.SaveWorkerStatus(state.RunID, ws), warnSaveWorkerStatus)
+}
+
+// addStageTokens accumulates a worker's token spend into its stage's running
+// total, so per-stage token budgets bound a stage's CUMULATIVE cost across all
+// its iterations (a review→fix loop is the motivating case).
+func addStageTokens(state *core.State, stage string, in, out int) {
+	if in == 0 && out == 0 {
+		return
+	}
+	if state.Budgets.StageTokensIn == nil {
+		state.Budgets.StageTokensIn = map[string]int{}
+	}
+	if state.Budgets.StageTokensOut == nil {
+		state.Budgets.StageTokensOut = map[string]int{}
+	}
+	state.Budgets.StageTokensIn[stage] += in
+	state.Budgets.StageTokensOut[stage] += out
+}
+
+// stageTokenBudgetExceeded returns a non-empty reason when a stage has already
+// spent its configured token budget (cumulative across iterations). It gates
+// re-entry into the stage — so a runaway review loop stops instead of burning
+// more tokens. (A single over-budget call can't be pre-empted without adapter
+// support; this caps the LOOP, and reviewContext:diff-only caps the single call.)
+func (e *Engine) stageTokenBudgetExceeded(state *core.State, stage workflows.Stage) string {
+	sb, ok := e.cfg.Budgets.Stage[stage.Name]
+	if !ok {
+		return ""
+	}
+	if sb.MaxTotalTokens > 0 && state.Budgets.StageTokensTotal(stage.Name) >= sb.MaxTotalTokens {
+		return fmt.Sprintf("stage %q exceeded its token budget (%d total tokens)", stage.Name, sb.MaxTotalTokens)
+	}
+	if sb.MaxInputTokens > 0 && state.Budgets.StageTokensIn[stage.Name] >= sb.MaxInputTokens {
+		return fmt.Sprintf("stage %q exceeded its input-token budget (%d)", stage.Name, sb.MaxInputTokens)
+	}
+	if sb.MaxOutputTokens > 0 && state.Budgets.StageTokensOut[stage.Name] >= sb.MaxOutputTokens {
+		return fmt.Sprintf("stage %q exceeded its output-token budget (%d)", stage.Name, sb.MaxOutputTokens)
+	}
+	return ""
 }
 
 // agentBudgetExceeded returns a non-empty reason when starting another agent

@@ -12,13 +12,13 @@ import (
 	"github.com/corteshvictor/vichu-flow/internal/core"
 )
 
-const (
-	// HeartbeatInterval is how often a lock owner renews its heartbeat.
-	HeartbeatInterval = 5 * time.Second
-	// HeartbeatTTL is how stale a heartbeat may be before the lock is considered
-	// orphaned. It must comfortably exceed HeartbeatInterval.
-	HeartbeatTTL = 30 * time.Second
-)
+// HeartbeatInterval is how often a lock owner renews its heartbeat. It is a var
+// (not a const) so tests can shrink it.
+var HeartbeatInterval = 5 * time.Second
+
+// HeartbeatTTL is how stale a heartbeat may be before the lock is considered
+// orphaned. It must comfortably exceed HeartbeatInterval.
+const HeartbeatTTL = 30 * time.Second
 
 // ErrLocked is returned when a run is already held by a live owner.
 var ErrLocked = errors.New("run is locked by a live process")
@@ -157,9 +157,12 @@ func (h *Handle) stillOwned() bool {
 	return cur.Token != "" && cur.Token == h.lock.Token
 }
 
-// StartHeartbeat renews the lock on an interval until ctx is canceled. Run it in
-// a goroutine for the lifetime of a run.
-func (h *Handle) StartHeartbeat(ctx context.Context) {
+// StartHeartbeat renews the lock on an interval until ctx is canceled. If the
+// lock is lost to another process (Heartbeat returns ErrLockLost), it invokes
+// onLost once and stops — the caller uses this to cancel the run rather than keep
+// working without ownership. onLost may be nil. Run it in a goroutine for the
+// lifetime of a run.
+func (h *Handle) StartHeartbeat(ctx context.Context, onLost func()) {
 	t := time.NewTicker(HeartbeatInterval)
 	defer t.Stop()
 	for {
@@ -167,7 +170,12 @@ func (h *Handle) StartHeartbeat(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			_ = h.Heartbeat()
+			if errors.Is(h.Heartbeat(), ErrLockLost) {
+				if onLost != nil {
+					onLost()
+				}
+				return
+			}
 		}
 	}
 }

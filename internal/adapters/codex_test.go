@@ -166,6 +166,19 @@ func TestCodexBuildArgsResume(t *testing.T) {
 	}
 }
 
+func TestCodexBuildArgsReadOnly(t *testing.T) {
+	c := NewCodex(CodexOptions{Bin: "codex"}) // default sandbox workspace-write
+
+	ro := c.buildArgs(Invocation{ReadOnly: true}, "")
+	if i := indexOf(ro, "--sandbox"); i < 0 || ro[i+1] != "read-only" {
+		t.Fatalf("a read-only invocation must run with --sandbox read-only, got %v", ro)
+	}
+	rw := c.buildArgs(Invocation{}, "")
+	if i := indexOf(rw, "--sandbox"); i < 0 || rw[i+1] != "workspace-write" {
+		t.Fatalf("a normal invocation keeps the configured sandbox, got %v", rw)
+	}
+}
+
 func indexOf(ss []string, want string) int {
 	for i, s := range ss {
 		if s == want {
@@ -173,6 +186,19 @@ func indexOf(ss []string, want string) int {
 		}
 	}
 	return -1
+}
+
+func TestCodexBuildArgsEffort(t *testing.T) {
+	c := NewCodex(CodexOptions{Bin: "codex"})
+
+	args := c.buildArgs(Invocation{Effort: "high"}, "")
+	if i := indexOf(args, "-c"); i < 0 || args[i+1] != "model_reasoning_effort=high" {
+		t.Fatalf("effort should map to `-c model_reasoning_effort=high`, got %v", args)
+	}
+	// No effort configured → no -c flag.
+	if i := indexOf(c.buildArgs(Invocation{}, ""), "-c"); i >= 0 {
+		t.Fatal("no effort must add no -c flag")
+	}
 }
 
 func TestCodexProbeVersionAndAuth(t *testing.T) {

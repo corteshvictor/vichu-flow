@@ -32,9 +32,11 @@ ui:
   timezone: local
 
 workflow:
-  default: quick        # quick | review
-  provider: ""          # workflow provider label; empty for quick
-  maxAutoIterations: 5  # max review iterations for the review auto-fix loop
+  default: quick           # quick | review
+  provider: ""             # workflow provider label; empty for quick
+  maxAutoIterations: 5     # max review iterations for the review auto-fix loop
+  reviewContext: diff-only # diff-only | full — reviewer sees just the diff (cheaper) or explores
+  requireGates: true       # block (don't "complete") if no verify gates are configured; set false for demo/fake
 
 workspace:
   isolation: current-worktree   # git required; agents write to the current worktree
@@ -69,9 +71,12 @@ budgets:
     maxWallClock: 2h
     maxCostUSD: 15
     maxAgentInvocations: 40
-    maxInputTokens: 0    # 0 = no limit; summed across all workers in a run
+    maxInputTokens: 0          # 0 = no limit; summed across all workers in a run
     maxOutputTokens: 0
-    maxTotalTokens: 0
+    maxTotalTokens: 1000000    # conservative backstop against a runaway run
+  stage:
+    review:
+      maxTotalTokens: 250000   # cap the review→fix loop (a real review can be token-heavy)
   context:
     maxContextPackKB: 64
     maxFilesPerPrompt: 30   # reserved; not yet enforced (no per-prompt context paths)

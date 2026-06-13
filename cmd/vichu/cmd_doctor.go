@@ -30,6 +30,10 @@ func cmdDoctor(args []string) error {
 		}
 		fmt.Printf("  %s %-22s %s\n", mark, label, detail)
 	}
+	// warn surfaces an advisory (e.g. an unbounded budget) without failing doctor.
+	warn := func(label, detail string) {
+		fmt.Printf("  ! %-22s %s\n", label, detail)
+	}
 
 	// Git is the hard requirement.
 	gitOK := workspace.GitAvailable()
@@ -45,6 +49,10 @@ func cmdDoctor(args []string) error {
 			check("git repository", false, err.Error())
 		} else {
 			check("git repository", true, root)
+		}
+		// Nudge older configs (pre-v0.2.1) whose token budget is still unlimited.
+		if cfg, err := config.Load(filepath.Join(root, config.FileName)); err == nil && cfg.Budgets.Run.MaxTotalTokens == 0 {
+			warn("token budget", i18n.T("doctor.tokens_unlimited"))
 		}
 	}
 

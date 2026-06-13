@@ -48,6 +48,25 @@ type WorkflowConfig struct {
 	Default           string `yaml:"default"`
 	Provider          string `yaml:"provider"`
 	MaxAutoIterations int    `yaml:"maxAutoIterations"`
+	// ReviewContext controls what a review stage's prompt carries: "diff-only"
+	// (default) gives the reviewer the changed files + content built from the
+	// run's mutation reports, so it judges the change without re-reading the whole
+	// repo (cheaper, fewer tokens); "full" gives only the task and lets the
+	// reviewer explore freely.
+	ReviewContext string `yaml:"reviewContext"`
+	// RequireGates blocks a run whose verify stage wanted gates but none were
+	// configured — so a run never reports "completed" having verified nothing. It
+	// is a *bool so an OMITTED value (older vichu.yaml from v0.2) defaults to
+	// required, while an explicit `requireGates: false` still opts out for
+	// demo/fake. Read it through GatesRequired().
+	RequireGates *bool `yaml:"requireGates"`
+}
+
+// GatesRequired reports whether a run must verify something: true unless the
+// config explicitly set requireGates: false. An omitted value (nil) defaults to
+// true so projects that predate the option are protected on upgrade.
+func (w WorkflowConfig) GatesRequired() bool {
+	return w.RequireGates == nil || *w.RequireGates
 }
 
 type WorkspaceConfig struct {
@@ -90,6 +109,12 @@ type RunBudget struct {
 type StageBudget struct {
 	MaxIterations int      `yaml:"maxIterations"`
 	MaxWallClock  Duration `yaml:"maxWallClock"`
+	// Per-stage token caps (0 = no limit). They bound the CUMULATIVE spend of a
+	// stage across all its iterations — e.g. budgets.stage.review.maxTotalTokens
+	// stops a review→fix loop that keeps burning tokens.
+	MaxTotalTokens  int `yaml:"maxTotalTokens"`
+	MaxInputTokens  int `yaml:"maxInputTokens"`
+	MaxOutputTokens int `yaml:"maxOutputTokens"`
 }
 
 type ContextBudget struct {
@@ -165,6 +190,7 @@ func (c *Config) applyDefaults() {
 	defaultStr(&c.UI.AgentOutputLanguage, "project")
 	defaultStr(&c.Workflow.Default, "quick")
 	defaultInt(&c.Workflow.MaxAutoIterations, 5)
+	defaultStr(&c.Workflow.ReviewContext, "diff-only")
 	defaultStr(&c.Workspace.Isolation, "current-worktree")
 	defaultStr(&c.Workspace.RequireCleanTree, "warn")
 	defaultInt(&c.Observability.WebPort, 3737)

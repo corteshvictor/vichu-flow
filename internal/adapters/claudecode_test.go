@@ -209,6 +209,19 @@ func TestClaudeCodeDisallowedToolsFlag(t *testing.T) {
 	}
 }
 
+func TestClaudeCodeReadOnlyDeniesEditTools(t *testing.T) {
+	c := NewClaudeCode(ClaudeCodeOptions{Bin: "claude"})
+	joined := strings.Join(c.buildArgs(Invocation{ReadOnly: true}, ""), " ")
+	if !strings.Contains(joined, "--disallowedTools") ||
+		!strings.Contains(joined, "Edit") || !strings.Contains(joined, "Write") {
+		t.Fatalf("a read-only stage must deny claude's edit tools, got %q", joined)
+	}
+	// A normal stage does not add the edit denials.
+	if strings.Contains(strings.Join(c.buildArgs(Invocation{}, ""), " "), "Write") {
+		t.Fatal("a non-read-only stage must not deny Write")
+	}
+}
+
 func TestParseMajor(t *testing.T) {
 	cases := []struct {
 		in    string

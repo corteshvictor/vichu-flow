@@ -33,9 +33,11 @@ conventions; set `en` or `es` to force a language in worker prompts.
 
 ```yaml
 workflow:
-  default: quick      # quick | review — which workflow `vichu run` uses without --workflow
-  provider: ""        # optional workflow provider label; recorded on the run
-  maxAutoIterations: 5  # review loop: max review iterations before blocking
+  default: quick          # quick | review — which workflow `vichu run` uses without --workflow
+  provider: ""            # optional workflow provider label; recorded on the run
+  maxAutoIterations: 5    # review loop: max review iterations before blocking
+  reviewContext: diff-only  # diff-only | full — what the reviewer's prompt carries
+  requireGates: true      # block (don't "complete") when no verify gates are configured
 ```
 
 - `default` — `quick` (explore → implement → verify) or `review` (adds an
@@ -44,6 +46,15 @@ workflow:
   auto-fix loop runs before it blocks for a human (counts reviews: N reviews
   allow up to N−1 auto-fixes, and the Nth review can still approve). Override per
   stage with `budgets.stage.review.maxIterations`.
+- `reviewContext` — `diff-only` (default) gives the reviewer the changed files
+  and their content (built from the run's mutation reports) so it judges the
+  change without re-reading the whole repo — fewer tokens, less free exploration.
+  `full` gives only the task and lets the reviewer explore. Pair with
+  `budgets.stage.review.maxTotalTokens` to cap the review loop's spend.
+- `requireGates` — `true` (the value a fresh `vichu init` writes) makes a run
+  **block** instead of reporting `completed` when its verify stage wanted gates
+  but none are configured — so a run never claims success having verified
+  nothing. Set `false` for demo/`fake` runs that intentionally have no gates.
 
 ## workspace
 
@@ -115,9 +126,11 @@ deny list), so the runtime's own mutation tracking and policy remain the
 verified backstop. Environment overrides:
 
 - `VICHU_CODEX_BIN` — path to the `codex` executable (default `codex`).
-- `VICHU_CODEX_SANDBOX` — `--sandbox` value (default `workspace-write`: the
-  worker edits files in the work dir but cannot reach the network or paths
-  outside it).
+- `VICHU_CODEX_SANDBOX` — `--sandbox` value for **write** stages (default
+  `workspace-write`: the worker edits files in the work dir but cannot reach the
+  network or paths outside it). A **read-only** stage (e.g. `review`) overrides
+  this to `read-only` so the reviewer is prevented from writing, not just caught
+  afterwards.
 - `VICHU_CODEX_EXTRA_ARGS` — extra CLI args appended verbatim (e.g.
   `-c model_reasoning_effort=high`).
 
@@ -160,6 +173,9 @@ budgets:
     implement:
       maxWallClock: 30m
       maxIterations: 5        # re-entries (resume, review/fix loops)
+    review:
+      maxTotalTokens: 60000   # cap a review→fix loop's CUMULATIVE token spend
+      maxInputTokens: 0       # 0 = no limit; also maxOutputTokens
   context:
     maxContextPackKB: 64      # cap on injected context pack size
     maxFilesPerPrompt: 30     # RESERVED — not yet enforced (no per-prompt context paths)

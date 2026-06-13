@@ -47,11 +47,20 @@ type BudgetState struct {
 	AgentInvocations      int     `json:"agent_invocations"`
 	TokensInSpent         int     `json:"tokens_in_spent"`
 	TokensOutSpent        int     `json:"tokens_out_spent"`
+	// Per-stage token spend, aggregated across a stage's iterations, for
+	// budgets.stage.<stage>.max*Tokens.
+	StageTokensIn  map[string]int `json:"stage_tokens_in,omitempty"`
+	StageTokensOut map[string]int `json:"stage_tokens_out,omitempty"`
 }
 
 // TokensTotalSpent is the sum of input and output tokens consumed by the run.
 func (b BudgetState) TokensTotalSpent() int {
 	return b.TokensInSpent + b.TokensOutSpent
+}
+
+// StageTokensTotal is the total tokens (in + out) spent within a single stage.
+func (b BudgetState) StageTokensTotal(stage string) int {
+	return b.StageTokensIn[stage] + b.StageTokensOut[stage]
 }
 
 // State is the source of truth for a run, persisted atomically to state.json.

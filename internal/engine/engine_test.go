@@ -117,6 +117,79 @@ func TestQuickRunEndToEnd(t *testing.T) {
 	}
 }
 
+// TestRequireGatesBlocksUnverifiedRun: with workflow.requireGates on, a run whose
+// verify stage wanted gates but found none configured must BLOCK — it must not
+// report "completed" having verified nothing.
+func TestRequireGatesBlocksUnverifiedRun(t *testing.T) {
+	dir := newTestRepo(t)
+	store := rt.Open(dir)
+	repo, _ := workspace.Detect(dir)
+
+	cfg := config.Default()
+	cfg.Workspace.RequireCleanTree = "allow"
+	required := true
+	cfg.Workflow.RequireGates = &required
+	cfg.Commands = nil // no test/lint/typecheck configured → verify has nothing to run
+
+	reg := adapters.NewRegistry()
+	reg.Register(adapters.FakeName, func() (adapters.Adapter, error) { return adapters.NewFake(adapters.FakeScript{}), nil })
+	e := New(Options{Store: store, Registry: reg, Config: cfg, Repo: repo})
+
+	state, err := e.Start(context.Background(), "task", "quick")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Status != core.StatusBlocked || !strings.Contains(state.BlockedReason, "nothing was verified") {
+		t.Fatalf("requireGates must block an unverified run, got %s (%s)", state.Status, state.BlockedReason)
+	}
+}
+
+// TestRunOnRepoWithNoCommits: VichuFlow must run on a freshly `git init`'d repo
+// with NO commits (unborn branch) — the user shouldn't need an initial commit.
+func TestRunOnRepoWithNoCommits(t *testing.T) {
+	if !workspace.GitAvailable() {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	for _, args := range [][]string{{"init"}, {"config", "user.email", "t@e.com"}, {"config", "user.name", "T"}} {
+		if out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	store := rt.Open(dir)
+	repo, err := workspace.Detect(dir)
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+
+	cfg := config.Default()
+	cfg.Workspace.RequireCleanTree = "allow"
+	cfg.Commands = nil // keep this about the workspace, not gates
+	noGates := false
+	cfg.Workflow.RequireGates = &noGates // this test is about the workspace, not verification
+
+	reg := adapters.NewRegistry()
+	reg.Register(adapters.FakeName, func() (adapters.Adapter, error) {
+		return adapters.NewFake(adapters.FakeScript{
+			Actions: map[string][]adapters.FakeAction{
+				"implementer": {{Type: "write_file", Path: "feature.txt", Content: "hi\n"}},
+			},
+		}), nil
+	})
+	e := New(Options{Store: store, Registry: reg, Config: cfg, Repo: repo})
+
+	state, err := e.Start(context.Background(), "task", "quick")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if state.Status != core.StatusCompleted {
+		t.Fatalf("a run on a repo with no commits should complete, got %s (%s)", state.Status, state.BlockedReason)
+	}
+	if !mutationRecorded(store, state.RunID, "feature.txt") {
+		t.Fatal("the worker's mutation must be audited on an unborn branch")
+	}
+}
+
 func TestGateFailureBlocksRun(t *testing.T) {
 	dir := newTestRepo(t)
 	store := rt.Open(dir)
@@ -650,6 +723,8 @@ func TestShellWorkerAllowNonZeroExit(t *testing.T) {
 		failWorker = "cmd /c exit 7"
 	}
 	cfg.Agents["default"] = config.AgentConfig{Provider: "shell", Command: failWorker, AllowNonZeroExit: true}
+	noGates := false
+	cfg.Workflow.RequireGates = &noGates // this test is about allowNonZeroExit, not gates
 
 	reg := adapters.NewRegistry()
 	reg.Register(adapters.ShellName, func() (adapters.Adapter, error) { return adapters.NewShell(), nil })

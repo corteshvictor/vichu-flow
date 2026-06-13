@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/corteshvictor/vichu-flow/internal/config"
+	"github.com/corteshvictor/vichu-flow/internal/core"
 	"github.com/corteshvictor/vichu-flow/internal/i18n"
 )
 
@@ -43,7 +44,20 @@ func cmdRun(args []string) error {
 	fmt.Println()
 	printStateSummary(state)
 	fmt.Printf("\n"+i18n.T("run.observe")+"\n", state.RunID)
-	return nil
+	return runStatusError(state)
+}
+
+// runStatusError turns a non-success terminal run state into a non-zero exit, so
+// automation never reads a blocked/failed/canceled run as shell success. The
+// human-readable summary is already printed; this only sets the exit code.
+func runStatusError(state *core.State) error {
+	if state.Status == core.StatusCompleted {
+		return nil
+	}
+	if state.BlockedReason != "" {
+		return fmt.Errorf("run %s: %s", state.Status, state.BlockedReason)
+	}
+	return fmt.Errorf("run %s", state.Status)
 }
 
 func workflowName(p *project, override string) string {

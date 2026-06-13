@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/corteshvictor/vichu-flow/internal/adapters"
@@ -76,6 +77,9 @@ type runState struct {
 	// re-enters it after a resume. Seeded once at Resume time (see
 	// sessionsToResume) and consumed on first use; nil/empty for a fresh Start.
 	resumeSession map[string]string
+	// lockLost is set by the heartbeat when another process reclaims this run's
+	// lock. The run loop stops promptly instead of working without ownership.
+	lockLost atomic.Bool
 }
 
 // wallClockSpent is the run's cumulative wall-clock in seconds.
@@ -144,12 +148,24 @@ func (e *Engine) Start(ctx context.Context, task, workflowName string) (*core.St
 		return nil, err
 	}
 	defer func() { _ = handle.Release() }()
-	hbCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go handle.StartHeartbeat(hbCtx)
 
 	rs := &runState{wf: wf, pack: pack.Markdown, baseSHA: snap.BaseSHA, startedAt: time.Now()}
-	return e.run(ctx, state, rs)
+	return e.runWithHeartbeat(ctx, handle, state, rs)
+}
+
+// runWithHeartbeat runs the stage loop while keeping the lock heartbeat fresh. If
+// the lock is lost to another process, it cancels the run so this process stops
+// promptly instead of working — and writing state — without ownership.
+func (e *Engine) runWithHeartbeat(ctx context.Context, handle *runtime.Handle, state *core.State, rs *runState) (*core.State, error) {
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	hbCtx, stopHB := context.WithCancel(ctx)
+	defer stopHB()
+	go handle.StartHeartbeat(hbCtx, func() {
+		rs.lockLost.Store(true)
+		cancelRun()
+	})
+	return e.run(runCtx, state, rs)
 }
 
 // ResumeOptions controls how a run is resumed.
@@ -207,10 +223,6 @@ func (e *Engine) Resume(ctx context.Context, runID string, opts ResumeOptions) (
 		e.log(i18n.T("engine.rebaselined"))
 	}
 
-	hbCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go handle.StartHeartbeat(hbCtx)
-
 	state.Status = core.StatusActive
 	state.BlockedReason = ""
 	e.emit(state, state.CurrentStage, "", core.EventRunResumed, nil)
@@ -233,7 +245,7 @@ func (e *Engine) Resume(ctx context.Context, runID string, opts ResumeOptions) (
 		spentBefore:   state.Budgets.WallClockSpentSeconds,
 		resumeSession: resumeSession,
 	}
-	return e.run(ctx, state, rs)
+	return e.runWithHeartbeat(ctx, handle, state, rs)
 }
 
 // lastSummaryOnDisk restores prompt continuity across resumes: the summary of
@@ -264,6 +276,10 @@ func (e *Engine) run(ctx context.Context, state *core.State, rs *runState) (*cor
 // It returns false once the run reaches a terminal state (completed, blocked,
 // failed, canceled) or cannot advance on valid evidence.
 func (e *Engine) step(ctx context.Context, state *core.State, rs *runState) bool {
+	if rs.lockLost.Load() {
+		e.log("lock ownership lost — another process took over this run; stopping without modifying its state")
+		return false
+	}
 	if e.finalizeIfCanceled(state) || state.Status.Terminal() {
 		return false
 	}
@@ -342,6 +358,13 @@ func (e *Engine) executeStage(ctx context.Context, state *core.State, rs *runSta
 	deadlineHit := stageCtx.Err() == context.DeadlineExceeded
 	stopDeadline()
 	stopWatch()
+
+	// Lock lost mid-stage: another process owns the run now. Stop WITHOUT writing
+	// a terminal state — the worker was killed by the canceled context; do not
+	// clobber the new owner's state with a fail/block from this process.
+	if rs.lockLost.Load() {
+		return false
+	}
 
 	// Wall-clock spend updates after every stage, success or not.
 	state.Budgets.WallClockSpentSeconds = rs.wallClockSpent()

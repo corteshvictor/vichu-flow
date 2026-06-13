@@ -309,7 +309,10 @@ func disableGates(t *testing.T, path string) {
 		}
 		out = append(out, line)
 	}
-	if err := os.WriteFile(path, []byte(strings.Join(out, "\n")), 0o644); err != nil {
+	// Disabling gates is demo/fake intent — opt out of requireGates so the run
+	// completes instead of blocking on "nothing verified".
+	content := strings.Replace(strings.Join(out, "\n"), "requireGates: true", "requireGates: false", 1)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
