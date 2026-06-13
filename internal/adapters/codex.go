@@ -192,9 +192,19 @@ func (c *Codex) launch(ctx context.Context, inv Invocation, resumeID string) (Se
 // rejects the flags ("unexpected argument '--sandbox'"). Correct order is
 // `codex exec --json --sandbox <mode> [--model <m>] resume <id> -`.
 func (c *Codex) buildArgs(inv Invocation, resumeID string) []string {
-	args := []string{"exec", "--json", "--sandbox", c.opts.Sandbox}
+	// A read-only stage (e.g. review) runs in a read-only sandbox: the reviewer is
+	// PREVENTED from writing, not just caught afterwards.
+	sandbox := c.opts.Sandbox
+	if inv.ReadOnly {
+		sandbox = "read-only"
+	}
+	args := []string{"exec", "--json", "--sandbox", sandbox}
 	if inv.Model != "" {
 		args = append(args, "--model", inv.Model)
+	}
+	// Effort maps to Codex's reasoning-effort config knob (minimal|low|medium|high).
+	if inv.Effort != "" {
+		args = append(args, "-c", "model_reasoning_effort="+inv.Effort)
 	}
 	args = append(args, c.opts.ExtraArgs...)
 	if resumeID != "" {

@@ -45,7 +45,12 @@ type Invocation struct {
 	// (e.g. needs_fixes then approved) WITHOUT relying on adapter-internal state,
 	// so it works even when the registry builds a fresh adapter per stage.
 	Iteration int
-	Command   []string // for the shell adapter: the command to run
+	// ReadOnly marks a stage the worker must not modify the tree in (e.g. review).
+	// Adapters that can sandbox enforce it BEFORE the fact — codex runs with
+	// `--sandbox read-only`, claude-code denies its edit tools — rather than
+	// letting the engine only detect a mutation after it happened.
+	ReadOnly bool
+	Command  []string // for the shell adapter: the command to run
 	// AllowNonZeroExit makes the shell adapter treat a non-zero exit code as a
 	// normal result instead of a worker failure.
 	AllowNonZeroExit bool

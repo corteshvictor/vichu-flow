@@ -199,10 +199,15 @@ func (c *ClaudeCode) buildArgs(inv Invocation, resumeID string) []string {
 	if inv.Model != "" {
 		args = append(args, "--model", inv.Model)
 	}
-	// The security policy travels into the agent's own permission system, so
-	// what vichu would block is also denied inside the worker.
-	if len(inv.DisallowedTools) > 0 {
-		args = append(args, "--disallowedTools", strings.Join(inv.DisallowedTools, ","))
+	// The security policy travels into the agent's own permission system, so what
+	// vichu would block is also denied inside the worker. A read-only stage also
+	// denies the edit tools, so the agent cannot write at all.
+	disallowed := inv.DisallowedTools
+	if inv.ReadOnly {
+		disallowed = append(append([]string{}, disallowed...), "Edit", "Write", "MultiEdit", "NotebookEdit")
+	}
+	if len(disallowed) > 0 {
+		args = append(args, "--disallowedTools", strings.Join(disallowed, ","))
 	}
 	return append(args, c.opts.ExtraArgs...)
 }

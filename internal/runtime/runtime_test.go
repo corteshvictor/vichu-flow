@@ -1,6 +1,8 @@
 package runtime
 
 import (
+	"context"
+	"errors"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -191,6 +193,58 @@ func TestReleaseDoesNotDeleteReclaimedLock(t *testing.T) {
 	}
 	if !st.Present || st.Lock.Token != "other-owner-token" {
 		t.Fatalf("Release must not delete a lock owned by a different token, got %+v", st)
+	}
+}
+
+// TestHeartbeatReturnsLockLostOnReclaim: once another process reclaims the lock
+// (different token), Heartbeat reports ErrLockLost instead of clobbering it.
+func TestHeartbeatReturnsLockLostOnReclaim(t *testing.T) {
+	s := Open(t.TempDir())
+	if err := s.CreateRun(newState("run-1")); err != nil {
+		t.Fatal(err)
+	}
+	h, err := s.AcquireLock("run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reclaimed := &core.Lock{RunID: "run-1", Token: "other-owner", HeartbeatAt: time.Now().UTC()}
+	if err := writeJSON(s.lockPath("run-1"), reclaimed); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Heartbeat(); !errors.Is(err, ErrLockLost) {
+		t.Fatalf("want ErrLockLost after reclaim, got %v", err)
+	}
+}
+
+// TestStartHeartbeatSignalsLockLoss: StartHeartbeat invokes onLost (so the engine
+// can stop the run) when the lock is reclaimed by another process.
+func TestStartHeartbeatSignalsLockLoss(t *testing.T) {
+	old := HeartbeatInterval
+	HeartbeatInterval = 5 * time.Millisecond
+	defer func() { HeartbeatInterval = old }()
+
+	s := Open(t.TempDir())
+	if err := s.CreateRun(newState("run-1")); err != nil {
+		t.Fatal(err)
+	}
+	h, err := s.AcquireLock("run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reclaimed := &core.Lock{RunID: "run-1", Token: "other-owner", HeartbeatAt: time.Now().UTC()}
+	if err := writeJSON(s.lockPath("run-1"), reclaimed); err != nil {
+		t.Fatal(err)
+	}
+
+	lost := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.StartHeartbeat(ctx, func() { lost <- struct{}{} })
+
+	select {
+	case <-lost:
+	case <-time.After(2 * time.Second):
+		t.Fatal("StartHeartbeat should have signaled lock loss")
 	}
 }
 

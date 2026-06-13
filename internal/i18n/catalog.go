@@ -69,15 +69,16 @@ var catalog = map[string]entry{
 	"cancel.already":     {en: "Run %s is already %s.", es: "El run %s ya está %s."},
 
 	// adapters / doctor
-	"adapters.header":    {en: "Agent adapters:", es: "Adapters de agentes:"},
-	"adapters.available": {en: "available", es: "disponible"},
-	"doctor.header":      {en: "VichuFlow doctor (%s/%s, go %s)", es: "VichuFlow doctor (%s/%s, go %s)"},
-	"doctor.adapters":    {en: "adapters:", es: "adapters:"},
-	"doctor.all_ok":      {en: "All required checks passed.", es: "Todas las verificaciones requeridas pasaron."},
-	"doctor.failures":    {en: "Some checks failed — see above.", es: "Algunas verificaciones fallaron — revisa arriba."},
-	"doctor.git_ok":      {en: "available", es: "disponible"},
-	"doctor.git_missing": {en: "not installed (required)", es: "no instalado (requerido)"},
-	"doctor.no_config":   {en: "not found — run `vichu init`", es: "no encontrado — ejecuta `vichu init`"},
+	"adapters.header":         {en: "Agent adapters:", es: "Adapters de agentes:"},
+	"adapters.available":      {en: "available", es: "disponible"},
+	"doctor.header":           {en: "VichuFlow doctor (%s/%s, go %s)", es: "VichuFlow doctor (%s/%s, go %s)"},
+	"doctor.adapters":         {en: "adapters:", es: "adapters:"},
+	"doctor.all_ok":           {en: "All required checks passed.", es: "Todas las verificaciones requeridas pasaron."},
+	"doctor.failures":         {en: "Some checks failed — see above.", es: "Algunas verificaciones fallaron — revisa arriba."},
+	"doctor.git_ok":           {en: "available", es: "disponible"},
+	"doctor.git_missing":      {en: "not installed (required)", es: "no instalado (requerido)"},
+	"doctor.no_config":        {en: "not found — run `vichu init`", es: "no encontrado — ejecuta `vichu init`"},
+	"doctor.tokens_unlimited": {en: "run token budget is unlimited — set budgets.run.maxTotalTokens to cap spend", es: "el presupuesto de tokens del run es ilimitado — define budgets.run.maxTotalTokens para acotar el gasto"},
 
 	// config
 	"config.header": {en: "Config: %s", es: "Configuración: %s"},

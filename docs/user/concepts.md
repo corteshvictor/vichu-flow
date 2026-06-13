@@ -55,7 +55,7 @@ Agent CLIs change their flags and output formats constantly; adapters isolate
 all of that churn so it never reaches the engine. Every adapter normalizes its
 agent's output into a common event stream and result.
 
-VichuFlow ships four adapters (the `codex` adapter is new in v0.2, on `main`):
+VichuFlow ships four adapters (the `codex` adapter arrived in v0.2):
 
 - **`claude-code`** — runs workers via the Claude Code CLI in headless mode:
   streamed tool-use events land in the run timeline, cost and token usage are
@@ -64,7 +64,8 @@ VichuFlow ships four adapters (the `codex` adapter is new in v0.2, on `main`):
 - **`codex`** — runs workers via the Codex CLI in non-interactive exec mode with
   streamed JSON: tool-use events land in the timeline, token usage and the
   thread id are captured (the thread id is the session resumed later). Its
-  sandbox (`workspace-write` by default) is its safety boundary.
+  sandbox is its safety boundary: `workspace-write` for write stages, and
+  `read-only` for read-only stages like `review` (so the reviewer cannot write).
 - **`shell`** — runs a configured command (tokenized with shell-like quoting,
   run directly without a shell) as a worker. Always available.
 - **`fake`** — a deterministic adapter used for tests and CI; it runs with no
@@ -102,7 +103,9 @@ internals, `vichu.yaml`, lockfiles) blocks the run by default, stages can
 declare scopes, and read-only stages (like `explore`) block on any mutation at
 all. See the `security` block in [configuration.md](configuration.md).
 
-Git is required for all of this in v0.1.
+In v0.2, this runs on **Git-backed** repositories (change detection, diffs, and
+rollback use Git). Running in any folder without Git — `workspace.provider:
+auto | git | filesystem` — lands in **v0.3**.
 
 ## Context pack
 
