@@ -87,6 +87,55 @@ jobs:
       # Install the Rust toolchain explicitly instead of relying on whatever the
       # runner image ships, so the example stays reproducible.
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal --no-self-update
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
       - name: Rust example
-        run: cd examples/rust && cargo +stable test
+        run: cd examples/rust && cargo test
+      # End-to-end smoke: actually run `vichu run` against each example's
+      # vichu.yaml (fake agent + the example's REAL gate), not just the gate
+      # command in isolation. Proves init-less run → completed → real gate passed.
+      - name: vichu run on each example
+        run: |
+          set -e
+          go build -o /tmp/vichu ./cmd/vichu
+          fake='{"result_text":"done","actions":{"implementer":[{"type":"write_file","path":"feature.txt","content":"x\n"}]}}'
+          for ex in go node python rust; do
+            tmp="$(mktemp -d)"
+            cp -R "examples/$ex/." "$tmp/"
+            ( cd "$tmp"
+              git init -q && git config user.email t@e.com && git config user.name T
+              git add -A && git commit -qm seed
+              printf '%s' "$fake" > .vichu-fake.json
+              VICHU_FAKE_SCRIPT="$tmp/.vichu-fake.json" /tmp/vichu run "add a feature file"
+              /tmp/vichu status | grep -qE 'status:[[:space:]]+completed' \
+                || { echo "::error::vichu run on examples/$ex did not complete"; /tmp/vichu status; exit 1; }
+              test -f feature.txt || { echo "::error::examples/$ex: agent change not persisted"; exit 1; }
+              rid="$(ls .vichu/runs | head -1)"
+              # A `test: auto` vichu.yaml would still complete with NO gate, so assert
+              # a REAL gate verdict (passed) plus that the audit recorded the change.
+              grep -rlE '"passed":[[:space:]]*true' ".vichu/runs/$rid/gates" >/dev/null \
+                || { echo "::error::examples/$ex: no passing gate verdict — the real gate did not run"; exit 1; }
+              grep -l feature.txt ".vichu/runs/$rid"/workers/*/mutations.json >/dev/null \
+                || { echo "::error::examples/$ex: feature.txt missing from mutations.json"; exit 1; }
+              echo "OK examples/$ex: completed, gate verdict passed, mutation recorded" )
+          done
+
+  workflows:
+    name: workflow & release config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: "1.26"
+      # Lint the GitHub Actions workflows and validate the GoReleaser config so
+      # broken YAML / release config is caught in CI, not by manual review.
+      - name: actionlint
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - uses: goreleaser/goreleaser-action@5daf1e915a5f0af01ddbcd89a43b8061ff4f1a89 # v7.2.2
+        with:
+          version: "v2.16.0"
+          install-only: true
+      - name: goreleaser check
+        run: goreleaser check
