@@ -102,7 +102,10 @@ jobs:
           fake='{"result_text":"done","actions":{"implementer":[{"type":"write_file","path":"feature.txt","content":"x\n"}]}}'
           for ex in go node python rust; do
             tmp="$(mktemp -d)"
-            cp -R "examples/$ex/." "$tmp/"
+            # Copy only TRACKED files (git archive), so build artifacts left by an
+            # earlier step (target/, node_modules/, __pycache__/) never leak in and
+            # make the run non-reproducible.
+            git archive "HEAD:examples/$ex" | tar -x -C "$tmp"
             ( cd "$tmp" || exit 1
               git init -q && git config user.email t@e.com && git config user.name T
               git add -A && git commit -qm seed
