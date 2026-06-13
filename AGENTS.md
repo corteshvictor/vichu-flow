@@ -15,6 +15,14 @@ notes live in `docs/internal/` (kept local, not committed).
 
 ## Git
 
+- **NEVER commit, stage, push, create a branch, open a PR, or merge unless the
+  user explicitly asks for that exact action in the current turn.** Treat git as
+  read-only by default. "Fix this" / "make the change" is permission to EDIT
+  FILES only — not to commit, push, or open/merge a PR. After editing, show the
+  diff and wait for the user to say what to do. Allowed without asking: read-only
+  inspection (`git status`, `git diff`, `git log`).
+- **NEVER merge anything to `main`.** Only the user decides what gets integrated,
+  and only after they have reviewed it. Never integrate unreviewed changes.
 - **NEVER add a `Co-Authored-By` trailer (or any AI/assistant attribution) to
   commit messages.** Commits are authored solely by the user. Hard rule.
 - Follow [Conventional Commits v1.0.0](https://www.conventionalcommits.org/en/v1.0.0/):
