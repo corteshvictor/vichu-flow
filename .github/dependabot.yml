@@ -7,10 +7,11 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
-    # Prefix becomes the PR title, which pr-title.yml lints against Conventional
-    # Commits. `build(deps)` is a valid type+scope; a bare `deps:` would fail.
+    # The prefix becomes the PR title (linted by pr-title.yml). Use `fix(deps)`
+    # so a runtime/security dependency update cuts a patch release + binaries —
+    # `build`/`chore` are hidden in release-please and would NOT ship a release.
     commit-message:
-      prefix: "build(deps)"
+      prefix: "fix(deps)"
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

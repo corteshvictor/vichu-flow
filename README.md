@@ -55,7 +55,7 @@ Three ideas hold it together:
 
 ## Status
 
-**v0.1 (in development).** Working today:
+**v0.1.0 released.** Shipping today:
 
 - `vichu init`, `doctor`, `run`, `status [--watch]`, `resume`, `cancel`, `adapters`, `config`
 - Persistent runtime: atomic `state.json`, append-only `events.ndjson`, heartbeat locks with orphan reclaim, cooperative cancel

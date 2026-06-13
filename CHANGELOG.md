@@ -17,9 +17,3 @@ Refactors), in the spirit of [Keep a Changelog](https://keepachangelog.com).
 ### Features
 
 * VichuFlow v0.1 runtime ([087dba5](https://github.com/corteshvictor/vichu-flow/commit/087dba5ad6d37a67d125d4e5750e8f2bd488d8cc))
-
-## [Unreleased]
-
-Initial development toward v0.1 — the runtime, `quick` workflow, verified gates,
-the `claude-code`/`shell`/`fake` adapters, workspace safety, the security policy,
-and hard budgets.
