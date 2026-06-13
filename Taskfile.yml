@@ -54,12 +54,13 @@ tasks:
       - gofmt -w .
 
   check:
-    desc: Format check, vet, test, lint, and vuln scan (full local gate)
+    desc: Format, vet, build, test, lint, and vuln scan (full local gate)
     cmds:
       # Task runs commands through its built-in POSIX shell (mvdan/sh), so this
       # `test -z "$(...)"` works on Windows too — it doesn't shell out to cmd.exe.
       - test -z "$(gofmt -l .)"
       - go vet ./...
+      - task: build
       - go test -race ./...
       - task: lint
       - task: vuln
