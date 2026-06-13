@@ -65,7 +65,7 @@ You'll see each stage as it runs, then a summary:
 Run run-20260610-041723-222a
   status:   completed
   stage:    ✓explore ✓implement ✓verify ✓done
-  budget:   2 agent call(s), $0.00, 0s
+  budget:   2 agent call(s), $0.00, 0s, 0 tokens
 ```
 
 ## 4. Inspect the run

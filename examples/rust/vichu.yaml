@@ -15,5 +15,7 @@ agents:
 
 commands:
   test: cargo test
-  lint: cargo clippy
-  typecheck: cargo check
+  # `auto` like the Node/Python examples — cargo clippy needs a separate rustup
+  # component that isn't guaranteed. Set `lint: cargo clippy` if you install it.
+  lint: auto
+  typecheck: auto
