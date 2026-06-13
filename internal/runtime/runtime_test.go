@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -133,6 +135,62 @@ func TestLockOrphanReclaimedByExpiredHeartbeat(t *testing.T) {
 	// Acquiring over an orphaned lock must succeed.
 	if _, err := s.AcquireLock("run-1"); err != nil {
 		t.Fatalf("acquire over orphan: %v", err)
+	}
+}
+
+// TestLockConcurrentAcquireOnlyOneWins races many goroutines on the same run;
+// the atomic (link-based) acquisition must let exactly one win.
+func TestLockConcurrentAcquireOnlyOneWins(t *testing.T) {
+	s := Open(t.TempDir())
+	if err := s.CreateRun(newState("run-1")); err != nil {
+		t.Fatal(err)
+	}
+	const n = 24
+	var wins int64
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.AcquireLock("run-1"); err == nil {
+				atomic.AddInt64(&wins, 1)
+			}
+		}()
+	}
+	wg.Wait()
+	if wins != 1 {
+		t.Fatalf("exactly one concurrent acquire must win, got %d", wins)
+	}
+}
+
+// TestReleaseDoesNotDeleteReclaimedLock: once an orphaned lock is reclaimed by a
+// new owner (different token), the old handle's Release must not delete it.
+func TestReleaseDoesNotDeleteReclaimedLock(t *testing.T) {
+	s := Open(t.TempDir())
+	if err := s.CreateRun(newState("run-1")); err != nil {
+		t.Fatal(err)
+	}
+	h1, err := s.AcquireLock("run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a second owner reclaiming: overwrite with a different token.
+	reclaimed := core.Lock{
+		PID: os.Getpid(), Hostname: hostname(), RunID: "run-1",
+		Token: "other-owner-token", AcquiredAt: time.Now().UTC(), HeartbeatAt: time.Now().UTC(),
+	}
+	if err := writeJSON(s.lockPath("run-1"), &reclaimed); err != nil {
+		t.Fatal(err)
+	}
+	if err := h1.Release(); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	st, err := s.InspectLock("run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Present || st.Lock.Token != "other-owner-token" {
+		t.Fatalf("Release must not delete a lock owned by a different token, got %+v", st)
 	}
 }
 

@@ -14,9 +14,10 @@ agents from the outside, and **decides stage transitions from evidence it
 verifies itself** — running your tests, lint, and typecheck — never from the
 agent's own say-so.
 
-> **Adapter status:** today VichuFlow ships the `claude-code`, `shell`, and
-> `fake` adapters. It is *designed* to support Codex CLI, OpenCode, and Gemini
-> CLI through the same contract — those land on the roadmap (v0.2+).
+> **Adapter status:** the v0.1 release ships the `claude-code`, `shell`, and
+> `fake` adapters; the `codex` adapter is on `main` for v0.2. More agents
+> (OpenCode, Gemini CLI) are designed for through the same contract and land on
+> the roadmap.
 
 ## Why VichuFlow?
 
@@ -36,8 +37,8 @@ an **external runtime that doesn't trust the agent**.
   automatic rollback if a check touches your files.
 - **It won't burn your budget.** Hard limits on wall-clock, cost, and tokens
   (summed across every agent) stop runaway loops and surprise bills.
-- **It's vendor-neutral.** Propose with one agent, implement with another,
-  review with a third — or none, using plain shell commands.
+- **It's vendor-neutral.** Implement with one agent, review with another — or
+  none, using plain shell commands.
 
 VichuFlow coordinates agents; it does not replace them or write code itself.
 
@@ -50,19 +51,23 @@ Three ideas hold it together:
    itself, captures exit code and output, and only that verdict authorizes a
    transition. An agent that claims success without passing the gate does not
    advance.
-3. **Cross-vendor by design.** Propose with one agent, implement with another,
-   review with a third. The adapter contract is the heart of the architecture.
+3. **Cross-vendor by design.** Implement with one agent and review with another
+   (or just one). The adapter contract is the heart of the architecture.
 
 ## Status
 
-**v0.1.0 released.** Shipping today:
+**Current release: v0.1.1.** It ships:
 
 - `vichu init`, `doctor`, `run`, `status [--watch]`, `resume`, `cancel`, `adapters`, `config`
 - Persistent runtime: atomic `state.json`, append-only `events.ndjson`, heartbeat locks with orphan reclaim, cooperative cancel
 - `quick` workflow (explore → implement → verify)
-- Adapters: **`claude-code`** (headless, streamed events, cost reporting, session resume), `shell`, and `fake` (deterministic, for CI)
+- Adapters: **`claude-code`** (headless, streamed events, session resume), `shell`, and `fake` (deterministic, for CI)
 - Verified gates, git workspace snapshots with content fingerprints, per-worker mutation tracking, and enforced mutation policy (sensitive files block, read-only stages enforced)
 - Git is required (agents writing code without version control have no undo)
+
+**Unreleased (v0.2, on `main`):** the `review` workflow (an adversarial review →
+auto-fix loop, bounded by a per-loop iteration budget) and the **`codex`**
+adapter. These are not in the v0.1.x release yet.
 
 The architecture is documented in [Concepts](docs/user/concepts.md) and the
 [runtime format](docs/user/runtime-format.md).

@@ -16,12 +16,13 @@ func NewRegistry() *Registry {
 	return &Registry{factories: map[string]Factory{}}
 }
 
-// DefaultRegistry returns a registry with the v0.1 adapters registered.
+// DefaultRegistry returns a registry with the built-in adapters registered.
 func DefaultRegistry() *Registry {
 	r := NewRegistry()
 	r.Register(ShellName, func() (Adapter, error) { return NewShell(), nil })
 	r.Register(FakeName, func() (Adapter, error) { return NewFakeFromEnv() })
 	r.Register(ClaudeCodeName, func() (Adapter, error) { return NewClaudeCodeFromEnv(), nil })
+	r.Register(CodexName, func() (Adapter, error) { return NewCodexFromEnv(), nil })
 	return r
 }
 

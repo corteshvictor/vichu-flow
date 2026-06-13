@@ -18,15 +18,30 @@ agent's word.
 ## Workflow and stages
 
 A **workflow** is an ordered set of **stages** the engine executes as a state
-machine. v0.1 ships the `quick` workflow:
+machine. The `quick` workflow is the minimal path:
 
 ```
 explore → implement → verify → done
 ```
 
-Each stage is one of three kinds:
+The `review` workflow adds an adversarial review with an auto-fix loop:
+
+```
+explore → implement → review ─approved→ verify → done
+                         ↑                │
+                         └──── fix ←───────┘ needs_fixes
+```
+
+Each stage is one of four kinds:
 
 - **worker** — invokes an agent (via an adapter) to do work.
+- **review** — invokes an agent like a worker, then requires a structured
+  **verdict** (`approved` / `needs_fixes` / `blocked`) and branches on it. A
+  review is not pass/fail: a reviewer asking for changes is `needs_fixes`, which
+  loops to a fix stage and re-reviews. The loop is bounded by an iteration
+  budget (`workflow.maxAutoIterations`, or `budgets.stage.<review>.maxIterations`
+  to override); a `blocked` verdict, or a missing/invalid one, stops the run for
+  a human — it never silently becomes `approved`.
 - **gate** — runs verification commands the runtime executes itself.
 - **terminal** — ends the run.
 
@@ -40,19 +55,23 @@ Agent CLIs change their flags and output formats constantly; adapters isolate
 all of that churn so it never reaches the engine. Every adapter normalizes its
 agent's output into a common event stream and result.
 
-v0.1 ships three adapters:
+VichuFlow ships four adapters (the `codex` adapter is new in v0.2, on `main`):
 
 - **`claude-code`** — runs workers via the Claude Code CLI in headless mode:
   streamed tool-use events land in the run timeline, cost and token usage are
   captured, and the agent session id is persisted so a blocked run resumes the
   same session.
+- **`codex`** — runs workers via the Codex CLI in non-interactive exec mode with
+  streamed JSON: tool-use events land in the timeline, token usage and the
+  thread id are captured (the thread id is the session resumed later). Its
+  sandbox (`workspace-write` by default) is its safety boundary.
 - **`shell`** — runs a configured command (tokenized with shell-like quoting,
   run directly without a shell) as a worker. Always available.
 - **`fake`** — a deterministic adapter used for tests and CI; it runs with no
   network and produces reproducible changes. A fresh project uses it by default.
 
-More agent adapters (Codex CLI, OpenCode, Gemini CLI) arrive in v0.2+. They
-implement the same `Adapter` contract.
+More agent adapters (OpenCode, Gemini CLI) arrive later. They implement the same
+`Adapter` contract.
 
 ## Gates
 

@@ -94,9 +94,9 @@ type StageBudget struct {
 
 type ContextBudget struct {
 	MaxContextPackKB int `yaml:"maxContextPackKB"`
-	// MaxFilesPerPrompt is RESERVED in v0.1: workflows do not yet attach
-	// per-prompt file lists (Invocation.ContextPaths), so there is nothing to
-	// limit. It becomes enforced when review/fix stages land in v0.2.
+	// MaxFilesPerPrompt is RESERVED and not yet enforced: workflows do not attach
+	// per-prompt file lists (Invocation.ContextPaths) yet, so there is nothing to
+	// limit. It takes effect once per-prompt context paths are wired.
 	MaxFilesPerPrompt int `yaml:"maxFilesPerPrompt"`
 	MaxLogExcerptKB   int `yaml:"maxLogExcerptKB"`
 }

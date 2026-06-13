@@ -57,7 +57,10 @@ func Build(root string, cfg *config.Config) (*Pack, error) {
 
 	wroteHeading := false
 	for _, rel := range dedupe(candidates) {
-		full := filepath.Join(root, rel)
+		full, ok := safeRepoPath(root, rel)
+		if !ok {
+			continue // absolute, escaping "..", or a symlink out of the repo — never inline
+		}
 		data, err := os.ReadFile(full)
 		if err != nil {
 			continue // not present — skip silently
@@ -78,6 +81,31 @@ func Build(root string, cfg *config.Config) (*Pack, error) {
 	}
 
 	return &Pack{Markdown: b.String(), Sources: sources}, nil
+}
+
+// safeRepoPath resolves rel against root and confirms the result stays INSIDE
+// the repo, returning ok=false for absolute paths, ".." escapes, and symlinks
+// that resolve outside root. Without this, a malicious vichu.yaml could declare
+// a convention like `../../.ssh/config` and have its contents inlined into the
+// prompt sent to the agents.
+func safeRepoPath(root, rel string) (string, bool) {
+	if rel == "" || filepath.IsAbs(rel) {
+		return "", false
+	}
+	full := filepath.Join(root, rel)
+	rootEval, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", false
+	}
+	fullEval, err := filepath.EvalSymlinks(full)
+	if err != nil {
+		return "", false // missing or unreadable — caller skips it anyway
+	}
+	rel2, err := filepath.Rel(rootEval, fullEval)
+	if err != nil || rel2 == ".." || strings.HasPrefix(rel2, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return full, true
 }
 
 func orAuto(s string) string {

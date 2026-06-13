@@ -117,6 +117,59 @@ func assertGatePassed(t *testing.T, dir string) {
 	t.Fatal("no passing gate_completed event — the real gate did not run/pass")
 }
 
+// TestCLIReviewLoopNeedsFixesThenApproves drives the `review` workflow through
+// the REAL CLI path (DefaultRegistry builds a fresh fake per stage from
+// VICHU_FAKE_SCRIPT). The reviewer rejects once, then approves on the next
+// iteration — proving verdict sequencing is driven by the engine's iteration,
+// not a shared adapter instance. This is the end-to-end guard for that gap.
+func TestCLIReviewLoopNeedsFixesThenApproves(t *testing.T) {
+	if !workspace.GitAvailable() {
+		t.Skip("git not available")
+	}
+	dir := setupRepoWithMarker(t, "seed.txt", "x\n")
+	t.Chdir(dir)
+
+	assertInit(t, dir, "")
+	// A reviewer that needs_fixes on the first review, then approves on the
+	// second; the implementer/fix worker writes the feature file.
+	script := `{"result_text":"done",` +
+		`"actions":{"implementer":[{"type":"write_file","path":"src/feature.txt","content":"feature\n"}]},` +
+		`"verdicts":{"reviewer":[` +
+		`{"status":"needs_fixes","summary":"missing piece","findings":[{"severity":"major","message":"add it"}]},` +
+		`{"status":"approved","summary":"fixed"}]}}`
+	scriptPath := filepath.Join(dir, ".vichu-fake.json")
+	if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("VICHU_FAKE_SCRIPT", scriptPath)
+	disableGates(t, filepath.Join(dir, "vichu.yaml")) // keep cross-platform; verify waves through
+
+	if err := cmdRun([]string{"--workflow", "review", "add a feature"}); err != nil {
+		t.Fatalf("cmdRun: %v", err)
+	}
+
+	store := runtime.Open(dir)
+	runID, _ := store.LatestRun()
+	state, err := store.LoadState(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Status != core.StatusCompleted {
+		t.Fatalf("review loop must complete after approval, got %s (%s)", state.Status, state.BlockedReason)
+	}
+	// Exactly two reviews must have happened: the reject and then the approval.
+	events, _ := store.ReadEvents(runID)
+	reviews := 0
+	for _, ev := range events {
+		if ev.Event == core.EventReviewCompleted {
+			reviews++
+		}
+	}
+	if reviews != 2 {
+		t.Fatalf("want 2 reviews (needs_fixes then approved), got %d — verdict sequencing is broken via the CLI", reviews)
+	}
+}
+
 // setupRepoWithMarker creates a committed git repo containing a stack marker.
 func setupRepoWithMarker(t *testing.T, marker, content string) string {
 	t.Helper()

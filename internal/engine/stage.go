@@ -29,6 +29,15 @@ func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runS
 		return false, nil
 	}
 
+	// The agent-invocation budget gates STARTING an agent — not gates or the
+	// terminal stage. Check it here, before incrementing, so a budget of N permits
+	// exactly N agents and still lets verify/done run.
+	if reason := e.agentBudgetExceeded(state); reason != "" {
+		e.emit(state, stage.Name, "", core.EventBudgetExceeded, map[string]any{"reason": reason})
+		e.block(state, reason)
+		return false, nil
+	}
+
 	agentCfg := e.cfg.Agent(stage.Role)
 	adapter, err := e.registry.Get(agentCfg.Provider)
 	if err != nil {
@@ -45,6 +54,7 @@ func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runS
 		WorkDir:          e.repo.Root(),
 		Model:            agentCfg.Model,
 		Effort:           agentCfg.Effort,
+		Iteration:        state.Iterations[stage.Name],
 		AllowNonZeroExit: agentCfg.AllowNonZeroExit,
 		DisallowedTools:  e.policy.ClaudeDisallowedTools(),
 	}
@@ -80,7 +90,7 @@ func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runS
 	e.saveState(state)
 	e.emit(state, stage.Name, workerID, core.EventWorkerStarted, map[string]any{"adapter": adapter.Name(), "role": stage.Role})
 
-	sess, err := adapter.Start(ctx, inv)
+	sess, err := e.startSession(ctx, adapter, state, rs, stage, inv)
 	if err != nil {
 		e.markWorkerFailed(state, ws)
 		return false, fmt.Errorf("starting worker %s: %w", workerID, err)
@@ -92,17 +102,30 @@ func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runS
 	// Persist whatever the worker produced — failed and canceled workers keep
 	// their captured output in the audit trail too.
 	e.persistWorkerResult(state.RunID, workerID, result)
-	if err != nil {
-		return e.handleWorkerError(ctx, state, ws, workerID, err)
-	}
+	// Finalize the mutation audit for ANY worker that started — even one that
+	// failed or was canceled. A worker that modified files and THEN failed must
+	// still leave a mutations.json (and sensitive/out-of-scope events): auditing
+	// what an agent touched is non-negotiable, independent of the run's outcome.
 	policyBlock := e.trackMutations(state, stage, workerID, rs.baseSHA, tracker)
 
-	// Aggregate per-worker usage into the run-level totals — the central
-	// accounting a multi-agent run needs to know it is saving, not burning.
+	// Aggregate usage/cost for ANY worker that ran — an adapter can report real
+	// cost/tokens even on an error result (claude-code does), so the run's budget
+	// must reflect what was actually burned, not just successful workers. Emit
+	// token_usage too: a failed worker's spend is still part of the timeline.
 	state.Budgets.CostUSDSpent += result.CostUSD
 	state.Budgets.TokensInSpent += result.TokensIn
 	state.Budgets.TokensOutSpent += result.TokensOut
 	state.Budgets.WallClockSpentSeconds = rs.wallClockSpent()
+	if result.TokensIn > 0 || result.TokensOut > 0 {
+		e.emit(state, stage.Name, workerID, "token_usage", map[string]any{
+			"tokens_in": result.TokensIn, "tokens_out": result.TokensOut,
+			"run_tokens_total": state.Budgets.TokensTotalSpent(),
+		})
+	}
+
+	if err != nil {
+		return e.handleWorkerError(ctx, state, ws, workerID, err)
+	}
 
 	fin := time.Now().UTC()
 	ws.Status = core.WorkerDone
@@ -110,12 +133,6 @@ func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runS
 	ws.SessionID = result.SessionID
 	e.warn(e.store.SaveWorkerStatus(state.RunID, ws), warnSaveWorkerStatus)
 	e.emit(state, stage.Name, workerID, core.EventWorkerFinished, map[string]any{"cost_usd": result.CostUSD})
-	if result.TokensIn > 0 || result.TokensOut > 0 {
-		e.emit(state, stage.Name, workerID, "token_usage", map[string]any{
-			"tokens_in": result.TokensIn, "tokens_out": result.TokensOut,
-			"run_tokens_total": state.Budgets.TokensTotalSpent(),
-		})
-	}
 
 	rs.lastSummary = truncate(result.Markdown, 2000)
 	e.warn(e.store.SaveStageSummary(state.RunID, stage.Name, []byte(rs.lastSummary)), "save stage summary")
@@ -126,7 +143,66 @@ func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runS
 		e.block(state, policyBlock)
 		return false, nil
 	}
+	if stage.Kind == workflows.KindReview {
+		return e.applyVerdict(state, stage, result), nil
+	}
 	return true, nil
+}
+
+// applyVerdict parses the reviewer's structured verdict, persists it as the
+// review's evidence, emits events, and decides the branch. A missing or invalid
+// verdict, or a "blocked" status, stops the run with an explicit reason — it
+// NEVER falls through to "approved". "needs_fixes" loops to the fix stage until
+// the auto-fix budget (workflow.maxAutoIterations) is spent.
+func (e *Engine) applyVerdict(state *core.State, stage workflows.Stage, result core.Result) bool {
+	iteration := state.Iterations[stage.Name]
+	v, err := core.ParseVerdictFromResult(result)
+	if err != nil {
+		e.block(state, fmt.Sprintf("review stage %q produced no valid verdict: %v", stage.Name, err))
+		return false
+	}
+	v.Stage, v.Iteration, v.CapturedAt = stage.Name, iteration, time.Now().UTC()
+	// The verdict is the public evidence that justifies the transition — and the
+	// engine reads it back to choose the branch. If it cannot be persisted, refuse
+	// to proceed rather than transition on evidence that was never recorded.
+	if err := e.store.SaveReviewVerdict(state.RunID, stage.Name, iteration, &v); err != nil {
+		e.block(state, fmt.Sprintf("cannot persist review verdict for %q (iteration %d): %v — refusing to transition on unrecorded evidence", stage.Name, iteration, err))
+		return false
+	}
+	e.emit(state, stage.Name, "", core.EventReviewCompleted, map[string]any{
+		"status": string(v.Status), "findings": len(v.Findings), "iteration": iteration,
+	})
+	for _, f := range v.Findings {
+		e.emit(state, stage.Name, "", core.EventReviewFindings, map[string]any{
+			"severity": string(f.Severity), "file": f.File, "message": f.Message,
+		})
+	}
+
+	switch v.Status {
+	case core.VerdictApproved:
+		return true // advanceStage recomputes the branch from the persisted verdict
+	case core.VerdictNeedsFixes:
+		if budget := e.reviewIterationBudget(stage); budget > 0 && iteration >= budget {
+			e.block(state, fmt.Sprintf("review loop reached its iteration budget (%d reviews) without approval", budget))
+			return false
+		}
+		return true
+	default: // core.VerdictBlocked
+		e.block(state, fmt.Sprintf("reviewer blocked the run: %s", v.Summary))
+		return false
+	}
+}
+
+// reviewIterationBudget is the single source of truth for how many review
+// iterations the auto-fix loop may run: a per-stage budget
+// (budgets.stage.<review>.maxIterations) overrides the workflow-wide default
+// (workflow.maxAutoIterations). It counts REVIEWS — N reviews allow up to N-1
+// auto-fixes, and the Nth review can still approve.
+func (e *Engine) reviewIterationBudget(stage workflows.Stage) int {
+	if sb, ok := e.cfg.Budgets.Stage[stage.Name]; ok && sb.MaxIterations > 0 {
+		return sb.MaxIterations
+	}
+	return e.cfg.Workflow.MaxAutoIterations
 }
 
 // runGateStage runs each configured verification command. A failing gate blocks
@@ -410,12 +486,25 @@ func (e *Engine) markWorker(state *core.State, ws *core.WorkerStatus, status cor
 	e.warn(e.store.SaveWorkerStatus(state.RunID, ws), warnSaveWorkerStatus)
 }
 
-// checkBudgets returns a non-empty reason if a run-level budget is exhausted.
-func (e *Engine) checkBudgets(state *core.State) string {
+// agentBudgetExceeded returns a non-empty reason when starting another agent
+// would exceed the run's agent-invocation budget. It is checked only before a
+// worker/review stage starts an agent, so a budget of N allows exactly N agents
+// while still permitting the gate and terminal stages to run.
+func (e *Engine) agentBudgetExceeded(state *core.State) string {
 	b := e.cfg.Budgets.Run
 	if b.MaxAgentInvocations > 0 && state.Budgets.AgentInvocations >= b.MaxAgentInvocations {
 		return fmt.Sprintf("agent invocation budget exhausted (%d)", b.MaxAgentInvocations)
 	}
+	return ""
+}
+
+// checkBudgets returns a non-empty reason if a run-level RESOURCE budget
+// (wall-clock, cost, tokens) is exhausted. These are hard limits that gate every
+// stage — including gates and completion — so a run never finishes over budget.
+// The agent-invocation budget is NOT here: it gates only the START of an agent
+// (see agentBudgetExceeded), so spending it does not block verify/done.
+func (e *Engine) checkBudgets(state *core.State) string {
+	b := e.cfg.Budgets.Run
 	if b.MaxWallClock > 0 && state.Budgets.WallClockSpentSeconds >= b.MaxWallClock.Std().Seconds() {
 		return fmt.Sprintf("wall-clock budget exhausted (%s)", b.MaxWallClock.Std())
 	}

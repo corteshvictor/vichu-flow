@@ -49,7 +49,7 @@ endpoint`) or a `BREAKING CHANGE:` footer — pre-1.0 this bumps the minor.
 Examples:
 
 ```text
-feat(adapters): add codex-cli adapter with review gates
+feat(adapters): add codex adapter with review gates
 fix(engine): clear active_worker when a run blocks
 docs: document the gateMutations rollback behavior
 style: gofmt the security package

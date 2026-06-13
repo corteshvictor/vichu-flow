@@ -32,9 +32,9 @@ ui:
   timezone: local
 
 workflow:
-  default: quick        # quick | sdd
-  provider: ""          # SDD provider (openspec | plain); empty for quick
-  maxAutoIterations: 5
+  default: quick        # quick | review
+  provider: ""          # workflow provider label; empty for quick
+  maxAutoIterations: 5  # max review iterations for the review auto-fix loop
 
 workspace:
   isolation: current-worktree   # git required; agents write to the current worktree
@@ -46,14 +46,16 @@ observability:
   webPort: 3737
 
 # Which adapter runs each worker role. "fake" runs deterministically with no
-# agent CLI, so a fresh project works out of the box. Switch to claude-code
-# (requires the Claude Code CLI) to run real agents.
+# agent CLI, so a fresh project works out of the box. Switch to claude-code or
+# codex (each requires its CLI) to run real agents.
 agents:
   default:
     provider: fake
   # default:
-  #   provider: claude-code
+  #   provider: claude-code   # requires the Claude Code CLI (claude)
   #   model: sonnet
+  # reviewer:
+  #   provider: codex         # requires the Codex CLI (codex)
 
 # Verification commands VichuFlow runs itself to gate stage transitions. Each
 # may be a single string or a {unix, windows} map. "auto" disables the gate.
@@ -72,7 +74,7 @@ budgets:
     maxTotalTokens: 0
   context:
     maxContextPackKB: 64
-    maxFilesPerPrompt: 30   # reserved in v0.1 (enforced when review/fix stages land)
+    maxFilesPerPrompt: 30   # reserved; not yet enforced (no per-prompt context paths)
     maxLogExcerptKB: 16
 
 security:
