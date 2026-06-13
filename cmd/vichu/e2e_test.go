@@ -49,10 +49,89 @@ func runCLIInitAndRun(t *testing.T, marker, content, language string) {
 	assertRunCompleted(t, dir)
 }
 
+// TestCLIRunWithRealGate covers the part of the v0.1 exit criterion that
+// TestCLIInitAndRun stops short of: `vichu run` end-to-end with a REAL
+// verification gate (not a disabled one) whose verdict actually gates the
+// transition, plus a correct mutations.json. It uses `go test`/`go vet`/`go
+// build` as the gates because the Go toolchain is present wherever this test
+// runs (the whole CI matrix), unlike pytest or node.
+func TestCLIRunWithRealGate(t *testing.T) {
+	if !workspace.GitAvailable() {
+		t.Skip("git not available")
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not on PATH")
+	}
+	dir := setupGoModule(t)
+	t.Chdir(dir)
+
+	assertInit(t, dir, "go") // init detects Go → real go test/vet/build gates
+	writeFakeScript(t, dir)  // fake worker writes feature.txt; gates stay REAL
+
+	if err := cmdRun([]string{"add a feature file"}); err != nil {
+		t.Fatalf("cmdRun: %v", err)
+	}
+	// completed ⇒ the real gates ran and PASSED — a failing gate would block.
+	assertRunCompleted(t, dir)
+	// explicit: the gate actually executed, not silently skipped.
+	assertGatePassed(t, dir)
+}
+
+// setupGoModule creates a committed git repo with a minimal but real Go module
+// (a package with a passing test), so the `go test` gate verifies actual code.
+func setupGoModule(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	gitInit(t, dir)
+	files := map[string]string{
+		"go.mod":       "module example.com/smoke\n\ngo 1.26\n",
+		"calc.go":      "package smoke\n\n// Add returns the sum of a and b.\nfunc Add(a, b int) int { return a + b }\n",
+		"calc_test.go": "package smoke\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(2, 3) != 5 {\n\t\tt.Fatal(\"want 5\")\n\t}\n}\n",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gitCommit(t, dir)
+	return dir
+}
+
+// assertGatePassed confirms a verification gate actually ran and passed (not
+// that the verify stage found no gates and waved the run through).
+func assertGatePassed(t *testing.T, dir string) {
+	t.Helper()
+	store := runtime.Open(dir)
+	runID, _ := store.LatestRun()
+	events, err := store.ReadEvents(runID)
+	if err != nil {
+		t.Fatalf("read events: %v", err)
+	}
+	for _, ev := range events {
+		if ev.Event == core.EventGateCompleted {
+			if passed, _ := ev.Detail["passed"].(bool); passed {
+				return
+			}
+		}
+	}
+	t.Fatal("no passing gate_completed event — the real gate did not run/pass")
+}
+
 // setupRepoWithMarker creates a committed git repo containing a stack marker.
 func setupRepoWithMarker(t *testing.T, marker, content string) string {
 	t.Helper()
 	dir := t.TempDir()
+	gitInit(t, dir)
+	if err := os.WriteFile(filepath.Join(dir, marker), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCommit(t, dir)
+	return dir
+}
+
+// gitInit initializes a git repo with a test identity.
+func gitInit(t *testing.T, dir string) {
+	t.Helper()
 	for _, args := range [][]string{
 		{"init"}, {"config", "user.email", "t@e.com"}, {"config", "user.name", "T"},
 	} {
@@ -60,11 +139,6 @@ func setupRepoWithMarker(t *testing.T, marker, content string) string {
 			t.Fatalf("git %v: %v\n%s", args, err, out)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(dir, marker), []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gitCommit(t, dir)
-	return dir
 }
 
 // assertInit runs `vichu init` and checks it detected the stack and ignored .vichu/.
@@ -90,13 +164,19 @@ func assertInit(t *testing.T, dir, language string) {
 // the run is cross-platform in CI.
 func configureFakeWorker(t *testing.T, dir string) {
 	t.Helper()
+	writeFakeScript(t, dir)
+	disableGates(t, filepath.Join(dir, "vichu.yaml"))
+}
+
+// writeFakeScript wires a deterministic fake worker that writes feature.txt.
+func writeFakeScript(t *testing.T, dir string) {
+	t.Helper()
 	script := `{"result_text":"done","actions":{"implementer":[{"type":"write_file","path":"feature.txt","content":"feature\n"}]}}`
 	scriptPath := filepath.Join(dir, ".vichu-fake.json")
 	if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("VICHU_FAKE_SCRIPT", scriptPath)
-	disableGates(t, filepath.Join(dir, "vichu.yaml"))
 }
 
 // assertRunCompleted checks the run finished and its mutation is recorded.
