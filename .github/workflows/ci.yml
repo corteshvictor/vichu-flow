@@ -103,7 +103,7 @@ jobs:
           for ex in go node python rust; do
             tmp="$(mktemp -d)"
             cp -R "examples/$ex/." "$tmp/"
-            ( cd "$tmp"
+            ( cd "$tmp" || exit 1
               git init -q && git config user.email t@e.com && git config user.name T
               git add -A && git commit -qm seed
               printf '%s' "$fake" > .vichu-fake.json
@@ -111,12 +111,12 @@ jobs:
               /tmp/vichu status | grep -qE 'status:[[:space:]]+completed' \
                 || { echo "::error::vichu run on examples/$ex did not complete"; /tmp/vichu status; exit 1; }
               test -f feature.txt || { echo "::error::examples/$ex: agent change not persisted"; exit 1; }
-              rid="$(ls .vichu/runs | head -1)"
               # A `test: auto` vichu.yaml would still complete with NO gate, so assert
               # a REAL gate verdict (passed) plus that the audit recorded the change.
-              grep -rlE '"passed":[[:space:]]*true' ".vichu/runs/$rid/gates" >/dev/null \
+              # The run-id glob (.vichu/runs/*) matches the single run in this temp repo.
+              grep -rlE '"passed":[[:space:]]*true' .vichu/runs/*/gates >/dev/null \
                 || { echo "::error::examples/$ex: no passing gate verdict — the real gate did not run"; exit 1; }
-              grep -l feature.txt ".vichu/runs/$rid"/workers/*/mutations.json >/dev/null \
+              grep -l feature.txt .vichu/runs/*/workers/*/mutations.json >/dev/null \
                 || { echo "::error::examples/$ex: feature.txt missing from mutations.json"; exit 1; }
               echo "OK examples/$ex: completed, gate verdict passed, mutation recorded" )
           done
