@@ -11,6 +11,13 @@ Refactors), in the spirit of [Keep a Changelog](https://keepachangelog.com).
 
 <!-- release-please will insert released versions below this line. -->
 
+## [0.1.1](https://github.com/corteshvictor/vichu-flow/compare/v0.1.0...v0.1.1) (2026-06-13)
+
+
+### Bug Fixes
+
+* **engine:** block instead of silently degrading on audit/persistence failures ([#11](https://github.com/corteshvictor/vichu-flow/issues/11)) ([211810c](https://github.com/corteshvictor/vichu-flow/commit/211810c0d160133b33b95cafdaa70b234a17c511))
+
 ## 0.1.0 (2026-06-11)
 
 
