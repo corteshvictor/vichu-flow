@@ -33,10 +33,17 @@ conventions; set `en` or `es` to force a language in worker prompts.
 
 ```yaml
 workflow:
-  default: quick      # which workflow `vichu run` uses without --workflow
-  provider: ""        # SDD provider (openspec | plain); used by the sdd workflow
-  maxAutoIterations: 5
+  default: quick      # quick | review — which workflow `vichu run` uses without --workflow
+  provider: ""        # optional workflow provider label; recorded on the run
+  maxAutoIterations: 5  # review loop: max review iterations before blocking
 ```
+
+- `default` — `quick` (explore → implement → verify) or `review` (adds an
+  adversarial review → auto-fix loop).
+- `maxAutoIterations` — for the `review` workflow, the most review iterations the
+  auto-fix loop runs before it blocks for a human (counts reviews: N reviews
+  allow up to N−1 auto-fixes, and the Nth review can still approve). Override per
+  stage with `budgets.stage.review.maxIterations`.
 
 ## workspace
 
@@ -64,14 +71,19 @@ agents:
     provider: claude-code   # requires the Claude Code CLI (`claude`)
     model: sonnet
   reviewer:
-    provider: shell
-    command: "./scripts/review.sh"   # for the shell provider
-    # allowNonZeroExit: true         # treat non-zero exit as a normal result
+    provider: codex         # requires the Codex CLI (`codex`)
+    # or: provider: shell; command: "./scripts/review.sh"
+    # allowNonZeroExit: true   # shell only: treat non-zero exit as a normal result
 ```
 
-The `quick` workflow uses the roles `explorer` and `implementer`. A `shell`
-worker that exits non-zero **fails the stage** (the run must not advance on a
-failed script) unless `allowNonZeroExit: true`.
+The `quick` workflow uses the roles `explorer` and `implementer`. The `review`
+workflow adds a `reviewer` (the review stage) and reuses `implementer` for its
+`fix` stage. A `reviewer` must return a structured verdict — a JSON object with
+a `status` of `approved`, `needs_fixes`, or `blocked` — either as structured
+output or as the final JSON object in its message (so a `shell` reviewer can
+just print it to stdout). A `shell` worker that exits non-zero **fails the
+stage** (the run must not advance on a failed script) unless
+`allowNonZeroExit: true`.
 
 ### claude-code adapter
 
@@ -88,6 +100,26 @@ Environment overrides:
   `acceptEdits`: the worker can edit files, while tools needing an interactive
   permission prompt are auto-denied so a headless run never hangs).
 - `VICHU_CLAUDE_EXTRA_ARGS` — extra CLI args (e.g. `--allowedTools ...`).
+
+### codex adapter
+
+Runs workers via the Codex CLI in non-interactive exec mode with streamed JSON
+(`codex exec --json`), captures token usage (Codex does not report a USD cost),
+and persists the thread id so a blocked run continues the same agent session.
+`vichu doctor` probes the CLI: binary present, version within the supported
+range (0.x–1.x), and authentication — `OPENAI_API_KEY`/`CODEX_API_KEY` in the
+environment authenticate non-interactively, otherwise `codex login status` is
+consulted; an unauthenticated or incompatible CLI reports unavailable with an
+actionable reason. Codex's safety boundary is its sandbox (it has no per-tool
+deny list), so the runtime's own mutation tracking and policy remain the
+verified backstop. Environment overrides:
+
+- `VICHU_CODEX_BIN` — path to the `codex` executable (default `codex`).
+- `VICHU_CODEX_SANDBOX` — `--sandbox` value (default `workspace-write`: the
+  worker edits files in the work dir but cannot reach the network or paths
+  outside it).
+- `VICHU_CODEX_EXTRA_ARGS` — extra CLI args appended verbatim (e.g.
+  `-c model_reasoning_effort=high`).
 
 ## commands
 
@@ -127,10 +159,10 @@ budgets:
   stage:                      # optional per-stage limits
     implement:
       maxWallClock: 30m
-      maxIterations: 5        # re-entries (resume, future fix loops)
+      maxIterations: 5        # re-entries (resume, review/fix loops)
   context:
     maxContextPackKB: 64      # cap on injected context pack size
-    maxFilesPerPrompt: 30     # RESERVED in v0.1 — enforced when review/fix stages land
+    maxFilesPerPrompt: 30     # RESERVED — not yet enforced (no per-prompt context paths)
     maxLogExcerptKB: 16       # gate output handed to agents is truncated to this
 ```
 

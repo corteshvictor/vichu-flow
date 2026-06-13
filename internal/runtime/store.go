@@ -162,6 +162,15 @@ func (s *Store) SaveWorkerStatus(runID string, w *core.WorkerStatus) error {
 	return writeJSON(filepath.Join(s.WorkerDir(runID, w.ID), "status.json"), w)
 }
 
+// LoadWorkerStatus reads workers/<id>/status.json.
+func (s *Store) LoadWorkerStatus(runID, workerID string) (*core.WorkerStatus, error) {
+	var w core.WorkerStatus
+	if err := readJSON(filepath.Join(s.WorkerDir(runID, workerID), "status.json"), &w); err != nil {
+		return nil, err
+	}
+	return &w, nil
+}
+
 // WriteWorkerFile writes an arbitrary file inside a worker's directory
 // (prompt.md, result.md, result.json, session.json, ...).
 func (s *Store) WriteWorkerFile(runID, workerID, name string, data []byte) error {
@@ -171,6 +180,23 @@ func (s *Store) WriteWorkerFile(runID, workerID, name string, data []byte) error
 // SaveMutationReport persists workers/<id>/mutations.json.
 func (s *Store) SaveMutationReport(runID, workerID string, r *core.MutationReport) error {
 	return writeJSON(filepath.Join(s.WorkerDir(runID, workerID), "mutations.json"), r)
+}
+
+// SaveReviewVerdict persists reviews/<stage>/iteration-<n>/verdict.json — the
+// validated review outcome, the runtime's public contract for a review stage.
+func (s *Store) SaveReviewVerdict(runID, stage string, iteration int, v *core.Verdict) error {
+	return writeJSON(filepath.Join(s.ReviewDir(runID, stage, iteration), "verdict.json"), v)
+}
+
+// LoadReviewVerdict reads reviews/<stage>/iteration-<n>/verdict.json — the
+// persisted review decision, read back on resume so a crash between saving the
+// verdict and advancing the stage loses no decision.
+func (s *Store) LoadReviewVerdict(runID, stage string, iteration int) (*core.Verdict, error) {
+	var v core.Verdict
+	if err := readJSON(filepath.Join(s.ReviewDir(runID, stage, iteration), "verdict.json"), &v); err != nil {
+		return nil, err
+	}
+	return &v, nil
 }
 
 // SaveStageSummary persists summaries/<stage>.md — the bounded summary later

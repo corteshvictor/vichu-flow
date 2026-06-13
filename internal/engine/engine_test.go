@@ -413,6 +413,48 @@ func TestBudgetExhaustionBlocksRun(t *testing.T) {
 	}
 }
 
+// TestAgentInvocationBudgetGatesOnlyAgentStarts: the agent-invocation budget
+// must gate only the START of an agent — not gates or completion. A budget of N
+// allows exactly N agents (verify/done still run); the (N+1)th agent is blocked
+// before it starts.
+func TestAgentInvocationBudgetGatesOnlyAgentStarts(t *testing.T) {
+	t.Run("exactly N completes", func(t *testing.T) {
+		dir := newTestRepo(t)
+		e := testEngine(t, dir)
+		e.cfg.Budgets.Run.MaxAgentInvocations = 2 // explore + implement = 2 agents
+
+		state, err := e.Start(context.Background(), "add a feature file", "quick")
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		// The 2 agents were used exactly; the verify gate and done stage must still
+		// run — the budget never starts a 3rd agent, but it must not block a gate.
+		if state.Status != core.StatusCompleted {
+			t.Fatalf("maxAgentInvocations=2 must let quick (2 agents) complete, got %s (%s)", state.Status, state.BlockedReason)
+		}
+	})
+
+	t.Run("blocks before the over-budget agent", func(t *testing.T) {
+		dir := newTestRepo(t)
+		store := rt.Open(dir)
+		e := testEngine(t, dir)
+		e.cfg.Budgets.Run.MaxAgentInvocations = 1 // explore consumes it; implement must not start
+
+		state, err := e.Start(context.Background(), "add a feature file", "quick")
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		if state.Status != core.StatusBlocked || !strings.Contains(state.BlockedReason, "agent invocation budget") {
+			t.Fatalf("must block before implement, got %s (%s)", state.Status, state.BlockedReason)
+		}
+		// The implement agent must NEVER have started — only explore ran.
+		workers, _ := store.ListWorkers(state.RunID)
+		if len(workers) != 1 || workers[0] != "explore-01" {
+			t.Fatalf("only explore should have run, got workers %v", workers)
+		}
+	})
+}
+
 func TestBlockedFixAcceptChangesCompletes(t *testing.T) {
 	dir := newTestRepo(t)
 	store := rt.Open(dir)
@@ -479,6 +521,91 @@ func TestBlockedFixAcceptChangesCompletes(t *testing.T) {
 	events, _ := store.ReadEvents(state.RunID)
 	if !hasEvent(events, "workspace_rebaselined") {
 		t.Fatal("workspace_rebaselined event missing")
+	}
+}
+
+// TestFailedWorkerStillAuditsMutations: a worker that modifies files and THEN
+// fails must still leave a mutations.json — a failed run is no excuse to skip
+// the audit of what the agent touched.
+func TestFailedWorkerStillAuditsMutations(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses sh")
+	}
+	dir := newTestRepo(t)
+	store := rt.Open(dir)
+	repo, _ := workspace.Detect(dir)
+
+	cfg := config.Default()
+	cfg.Workspace.RequireCleanTree = "allow"
+	// The implementer writes a file and THEN exits non-zero.
+	cfg.Agents["implementer"] = config.AgentConfig{Provider: "shell", Command: "sh -c 'echo x > touched.txt; exit 1'"}
+
+	reg := adapters.NewRegistry()
+	reg.Register(adapters.FakeName, func() (adapters.Adapter, error) { return adapters.NewFake(adapters.FakeScript{}), nil })
+	reg.Register(adapters.ShellName, func() (adapters.Adapter, error) { return adapters.NewShell(), nil })
+	e := New(Options{Store: store, Registry: reg, Config: cfg, Repo: repo})
+
+	state, err := e.Start(context.Background(), "task", "quick")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Status != core.StatusFailed {
+		t.Fatalf("failing worker must fail the run, got %s (%s)", state.Status, state.BlockedReason)
+	}
+	// The file the worker wrote before failing must exist on disk...
+	if _, err := os.Stat(filepath.Join(dir, "touched.txt")); err != nil {
+		t.Fatalf("worker's file should exist: %v", err)
+	}
+	// ...and it MUST be audited in a mutations.json despite the failure.
+	if !mutationRecorded(store, state.RunID, "touched.txt") {
+		t.Fatal("a failed worker's mutation must still be audited in mutations.json")
+	}
+	events, _ := store.ReadEvents(state.RunID)
+	if !hasEvent(events, core.EventMutationTracked) {
+		t.Fatal("a failed worker must still emit mutation_tracked")
+	}
+}
+
+// TestFailedWorkerStillCountsBudget: a worker that reports real cost/tokens and
+// THEN fails must still have that spend aggregated into the run budget — status
+// must not under-report what was actually burned.
+func TestFailedWorkerStillCountsBudget(t *testing.T) {
+	dir := newTestRepo(t)
+	store := rt.Open(dir)
+	repo, _ := workspace.Detect(dir)
+
+	cfg := config.Default()
+	cfg.Workspace.RequireCleanTree = "allow"
+
+	reg := adapters.NewRegistry()
+	// The explorer reports cost/tokens AND fails (Result returns an error).
+	reg.Register(adapters.FakeName, func() (adapters.Adapter, error) {
+		return adapters.NewFake(adapters.FakeScript{CostUSD: 5, TokensIn: 100, TokensOut: 50, ResultErr: "boom"}), nil
+	})
+	e := New(Options{Store: store, Registry: reg, Config: cfg, Repo: repo})
+
+	state, err := e.Start(context.Background(), "task", "quick")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Status != core.StatusFailed {
+		t.Fatalf("worker error must fail the run, got %s (%s)", state.Status, state.BlockedReason)
+	}
+	// The failed worker's spend must count toward the run budget...
+	if state.Budgets.CostUSDSpent != 5 || state.Budgets.TokensTotalSpent() != 150 {
+		t.Fatalf("failed worker spend must aggregate: cost=%v tokens=%d", state.Budgets.CostUSDSpent, state.Budgets.TokensTotalSpent())
+	}
+	// ...and that must be persisted, not just in memory.
+	disk, err := store.LoadState(state.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disk.Budgets.CostUSDSpent != 5 || disk.Budgets.TokensTotalSpent() != 150 {
+		t.Fatalf("state.json must persist the failed worker's spend, got cost=%v tokens=%d", disk.Budgets.CostUSDSpent, disk.Budgets.TokensTotalSpent())
+	}
+	events, _ := store.ReadEvents(state.RunID)
+	if !hasEvent(events, "token_usage") {
+		t.Fatal("token_usage must be emitted even for a failed worker")
 	}
 }
 
@@ -997,6 +1124,46 @@ func assertWorkerStatus(t *testing.T, store *rt.Store, runID, workerID string, w
 	}
 	if ws.Status != want {
 		t.Fatalf("worker %s status = %q, want %q", workerID, ws.Status, want)
+	}
+}
+
+// TestAdvanceStageTransitionIsConsistent: a stage transition is persisted in a
+// single write, so the on-disk state never shows a stage that is BOTH done and
+// current_stage — the inconsistency that would re-run a completed stage on a
+// resume after a crash mid-transition.
+func TestAdvanceStageTransitionIsConsistent(t *testing.T) {
+	dir := newTestRepo(t)
+	store := rt.Open(dir)
+	repo, _ := workspace.Detect(dir)
+	e := New(Options{Store: store, Registry: adapters.NewRegistry(), Config: config.Default(), Repo: repo})
+
+	state := &core.State{
+		RunID:        "run-x",
+		Status:       core.StatusActive,
+		Stages:       map[string]core.StageStatus{"implement": core.StageActive, "verify": core.StagePending},
+		CurrentStage: "implement",
+		Iterations:   map[string]int{},
+	}
+	if err := store.CreateRun(state); err != nil {
+		t.Fatal(err)
+	}
+
+	if ok := e.advanceStage(state, workflows.Stage{Name: "implement", Kind: workflows.KindWorker, Next: "verify"}); !ok {
+		t.Fatal("advanceStage should succeed")
+	}
+
+	disk, err := store.LoadState("run-x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disk.Stages["implement"] != core.StageDone {
+		t.Fatalf("implement should be done, got %s", disk.Stages["implement"])
+	}
+	if disk.CurrentStage != "verify" {
+		t.Fatalf("current_stage should be verify, got %s", disk.CurrentStage)
+	}
+	if disk.Stages[disk.CurrentStage] == core.StageDone {
+		t.Fatal("current_stage must never already be marked done (crash inconsistency)")
 	}
 }
 

@@ -72,6 +72,10 @@ type runState struct {
 	// spentBefore is the wall-clock already consumed by previous sessions of
 	// this run (resume accumulates spend; it never resets the meter).
 	spentBefore float64
+	// resumeSession maps a stage to an agent session id to continue when the run
+	// re-enters it after a resume. Seeded once at Resume time (see
+	// sessionsToResume) and consumed on first use; nil/empty for a fresh Start.
+	resumeSession map[string]string
 }
 
 // wallClockSpent is the run's cumulative wall-clock in seconds.
@@ -172,6 +176,9 @@ func (e *Engine) Resume(ctx context.Context, runID string, opts ResumeOptions) (
 
 	handle, err := e.store.AcquireLock(runID)
 	if err != nil {
+		if errors.Is(err, runtime.ErrLocked) {
+			return nil, fmt.Errorf("run %s is already being executed by a live process — cancel it with `vichu cancel %s` or wait for it to finish", runID, runID)
+		}
 		return nil, err
 	}
 	defer func() { _ = handle.Release() }()
@@ -208,16 +215,23 @@ func (e *Engine) Resume(ctx context.Context, runID string, opts ResumeOptions) (
 	state.BlockedReason = ""
 	e.emit(state, state.CurrentStage, "", core.EventRunResumed, nil)
 
+	// Seed the agent session to continue BEFORE reconciling: reconcile clears
+	// active-worker bookkeeping for interrupted workers, while the session seed
+	// comes from the latest COMPLETED worker of the stage being re-entered.
+	resumeSession := e.sessionsToResume(state)
+	e.reconcileInterruptedWorkers(state)
+
 	if state.Iterations == nil {
 		state.Iterations = map[string]int{}
 	}
 	rs := &runState{
-		wf:          wf,
-		pack:        e.store.ContextPack(runID),
-		baseSHA:     snap.BaseSHA,
-		lastSummary: e.lastSummaryOnDisk(wf, state),
-		startedAt:   time.Now(),
-		spentBefore: state.Budgets.WallClockSpentSeconds,
+		wf:            wf,
+		pack:          e.store.ContextPack(runID),
+		baseSHA:       snap.BaseSHA,
+		lastSummary:   e.lastSummaryOnDisk(wf, state),
+		startedAt:     time.Now(),
+		spentBefore:   state.Budgets.WallClockSpentSeconds,
+		resumeSession: resumeSession,
 	}
 	return e.run(ctx, state, rs)
 }
@@ -237,36 +251,43 @@ func (e *Engine) lastSummaryOnDisk(wf *workflows.Workflow, state *core.State) st
 	return last
 }
 
-// run is the shared stage loop used by both Start and Resume. Each iteration
-// either advances to the next stage or returns because the run reached a
-// terminal state (completed, blocked, failed, canceled).
+// run is the shared stage loop used by both Start and Resume. It steps until the
+// run reaches a terminal state; every transition is decided by verified evidence
+// inside step, never by an agent's claim.
 func (e *Engine) run(ctx context.Context, state *core.State, rs *runState) (*core.State, error) {
-	for {
-		if e.finalizeIfCanceled(state) || state.Status.Terminal() {
-			return state, nil
-		}
-		// Budgets are HARD limits: an over-budget run blocks here even if the
-		// only thing left is the terminal stage — it never completes over budget.
-		if e.budgetBlocked(state) {
-			return state, nil
-		}
-		stage, ok := rs.wf.Stage(state.CurrentStage)
-		if !ok {
-			e.fail(state, "unknown stage "+state.CurrentStage)
-			return state, nil
-		}
-		if stage.Kind == workflows.KindTerminal {
-			e.complete(state)
-			return state, nil
-		}
-		if e.stageIterationsBlocked(state, stage) {
-			return state, nil
-		}
-		if !e.executeStage(ctx, state, rs, stage) {
-			return state, nil // the stage reached a terminal state
-		}
-		e.advanceStage(state, stage)
+	for e.step(ctx, state, rs) { //nolint:revive // empty body: step does the work, returns whether to continue
 	}
+	return state, nil
+}
+
+// step runs one iteration of the stage loop and reports whether to continue.
+// It returns false once the run reaches a terminal state (completed, blocked,
+// failed, canceled) or cannot advance on valid evidence.
+func (e *Engine) step(ctx context.Context, state *core.State, rs *runState) bool {
+	if e.finalizeIfCanceled(state) || state.Status.Terminal() {
+		return false
+	}
+	// Budgets are HARD limits: an over-budget run blocks here even if the only
+	// thing left is the terminal stage — it never completes over budget.
+	if e.budgetBlocked(state) {
+		return false
+	}
+	stage, ok := rs.wf.Stage(state.CurrentStage)
+	if !ok {
+		e.fail(state, "unknown stage "+state.CurrentStage)
+		return false
+	}
+	if stage.Kind == workflows.KindTerminal {
+		e.complete(state)
+		return false
+	}
+	if e.stageIterationsBlocked(state, stage) {
+		return false
+	}
+	if !e.executeStage(ctx, state, rs, stage) {
+		return false // the stage reached a terminal state
+	}
+	return e.advanceStage(state, stage) // false ⇒ could not decide from evidence
 }
 
 // budgetBlocked blocks the run if a run-level budget is exhausted.
@@ -344,7 +365,9 @@ func (e *Engine) executeStage(ctx context.Context, state *core.State, rs *runSta
 // dispatchStage runs the stage body appropriate to its kind.
 func (e *Engine) dispatchStage(ctx context.Context, state *core.State, rs *runState, stage workflows.Stage) (bool, error) {
 	switch stage.Kind {
-	case workflows.KindWorker:
+	case workflows.KindWorker, workflows.KindReview:
+		// A review runs an agent exactly like a worker; runWorkerStage then
+		// parses the verdict and picks the branch (see applyVerdict).
 		return e.runWorkerStage(ctx, state, rs, stage)
 	case workflows.KindGate:
 		return e.runGateStage(ctx, state, rs, stage)
@@ -353,14 +376,46 @@ func (e *Engine) dispatchStage(ctx context.Context, state *core.State, rs *runSt
 	}
 }
 
-// advanceStage records a stage as done and transitions to the next.
-func (e *Engine) advanceStage(state *core.State, stage workflows.Stage) {
+// advanceStage records a stage as done and transitions to the next, returning
+// false if it blocked the run instead. A review stage's branch is recomputed
+// from its persisted verdict (crash-safe — the verdict is on disk before this
+// runs); other stages use their static Next.
+func (e *Engine) advanceStage(state *core.State, stage workflows.Stage) bool {
+	next := stage.Next
+	if stage.Kind == workflows.KindReview {
+		branch, ok := e.reviewBranch(state, stage)
+		if !ok {
+			e.block(state, fmt.Sprintf("cannot read the persisted verdict for review stage %q — refusing to transition without verifiable evidence", stage.Name))
+			return false
+		}
+		next = branch
+	}
+	// Mark the stage done AND move to the next stage in a SINGLE persisted write.
+	// Two writes could leave a crash window where a stage is marked done while it
+	// is still current_stage, which would re-run a completed stage on resume.
 	state.Stages[stage.Name] = core.StageDone
+	state.CurrentStage = next
 	e.saveState(state)
 	e.emit(state, stage.Name, "", core.EventStageCompleted, nil)
-	e.emit(state, "", "", core.EventStageTransition, map[string]any{"from": stage.Name, "to": stage.Next})
-	state.CurrentStage = stage.Next
-	e.saveState(state)
+	e.emit(state, "", "", core.EventStageTransition, map[string]any{"from": stage.Name, "to": next})
+	return true
+}
+
+// reviewBranch picks a review stage's next stage from its persisted verdict.
+// advanceStage is only reached for approved/needs_fixes (a blocked verdict or an
+// exhausted auto-fix budget stops the run earlier in applyVerdict), so the
+// choice is binary: approved advances, anything else loops to the fix stage.
+// ok=false means the verdict could not be read — the caller must block rather
+// than guess a branch, so a lost verdict never silently routes to fix.
+func (e *Engine) reviewBranch(state *core.State, stage workflows.Stage) (string, bool) {
+	v, err := e.store.LoadReviewVerdict(state.RunID, stage.Name, state.Iterations[stage.Name])
+	if err != nil {
+		return "", false
+	}
+	if v.Status == core.VerdictApproved {
+		return stage.NextOnApproved, true
+	}
+	return stage.NextOnNeedsFixes, true
 }
 
 // withBudgetDeadline derives the stage context's deadline from the remaining

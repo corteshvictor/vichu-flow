@@ -18,6 +18,10 @@ func TestMain(m *testing.M) {
 		runClaudeStub()
 		return
 	}
+	if os.Getenv("VICHU_CODEX_STUB") == "1" {
+		runCodexStub()
+		return
+	}
 	os.Exit(m.Run())
 }
 

@@ -63,8 +63,8 @@ func TestAgentFallback(t *testing.T) {
 	if c.Agent("implementer").Provider != "shell" {
 		t.Errorf("should fall back to default role")
 	}
-	c.Agents["reviewer"] = AgentConfig{Provider: "codex-cli"}
-	if c.Agent("reviewer").Provider != "codex-cli" {
+	c.Agents["reviewer"] = AgentConfig{Provider: "codex"}
+	if c.Agent("reviewer").Provider != "codex" {
 		t.Errorf("explicit role should win")
 	}
 }

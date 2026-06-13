@@ -26,6 +26,8 @@ documents the layout and schemas for `schema_version: 1`.
     output.log            # full captured stdout+stderr
     verdict.json          # exit code, duration, passed
     excerpt.txt           # bounded tail of a FAILED gate's output (context budget)
+  reviews/<stage>/iteration-<n>/
+    verdict.json          # validated review verdict for that iteration
   summaries/<stage>.md    # bounded per-stage summary passed to later stages
   artifacts/              # workflow artifacts
 ```
@@ -69,10 +71,12 @@ One JSON object per line, append-only:
 Stable event names include: `run_created`, `run_resumed`, `run_completed`,
 `run_blocked`, `run_failed`, `run_canceled`, `stage_started`,
 `stage_completed`, `stage_transition`, `worker_started`, `worker_finished`,
-`tool_use`, `agent_text`, `token_usage`, `gate_started`, `gate_completed`,
-`gate_mutation`, `gate_rolled_back`, `mutation_tracked`, `out_of_scope_mutation`,
-`sensitive_mutation`, `policy_blocked`, `workspace_drift`,
-`workspace_rebaselined`, `budget_exceeded`, `output_truncated`.
+`worker_interrupted`, `worker_resumed`, `worker_resume_failed`, `tool_use`,
+`agent_text`, `token_usage`, `gate_started`, `gate_completed`, `gate_mutation`,
+`gate_rolled_back`, `review_completed`, `review_findings`, `mutation_tracked`,
+`out_of_scope_mutation`, `sensitive_mutation`, `policy_blocked`,
+`workspace_drift`, `workspace_rebaselined`, `budget_exceeded`,
+`output_truncated`.
 
 All runtime data is English regardless of the UI language: these files are a
 machine-readable contract, and views translate labels around them.
@@ -108,6 +112,23 @@ drift detection on resume compares content, not just file names.
 ```
 
 `passed` is the authoritative signal for a stage transition.
+
+## verdict.json (review evidence)
+
+Written by a review stage to `reviews/<stage>/iteration-<n>/verdict.json`. It is
+the runtime's validated record of a review — not the raw text the agent emitted.
+
+```json
+{ "status": "needs_fixes", "summary": "missing tests",
+  "findings": [ { "severity": "major", "file": "calc.go", "message": "add a test" } ],
+  "stage": "review", "iteration": 1, "captured_at": "..." }
+```
+
+`status` is one of `approved`, `needs_fixes`, or `blocked`. The engine branches
+on it (`approved` → advance, `needs_fixes` → loop to the fix stage, `blocked` →
+stop for a human) and recomputes that branch from this file on resume, so the
+decision survives a crash. A missing or invalid verdict blocks the run — it
+never silently becomes `approved`. `severity` is `blocker`, `major`, or `minor`.
 
 ## mutations.json (per worker)
 

@@ -41,7 +41,7 @@ var catalog = map[string]entry{
 	"run.no_config":     {en: "no vichu.yaml found — run `vichu init` first", es: "no se encontró vichu.yaml — ejecuta `vichu init` primero"},
 	"run.observe":       {en: "Observe: vichu status %s", es: "Observa: vichu status %s"},
 	"run.flag_workflow": {en: "workflow to run (default: from vichu.yaml)", es: "workflow a ejecutar (default: el de vichu.yaml)"},
-	"run.flag_provider": {en: "SDD provider (e.g. openspec)", es: "provider SDD (p. ej. openspec)"},
+	"run.flag_provider": {en: "workflow provider label", es: "etiqueta de provider del workflow"},
 
 	// status
 	"status.run":           {en: "Run %s", es: "Run %s"},

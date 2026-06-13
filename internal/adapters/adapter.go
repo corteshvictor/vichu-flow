@@ -1,5 +1,6 @@
 // Package adapters defines the contract between VichuFlow and the coding agents
-// it orchestrates, plus the v0.1 implementations (fake, shell).
+// it orchestrates, plus the built-in implementations (claude-code, codex, shell,
+// fake).
 //
 // Adapters are the project's frontier of fragility: agent CLIs change their
 // flags and output formats, so all of that churn is isolated here and never
@@ -39,7 +40,12 @@ type Invocation struct {
 	ContextPaths []string // files the worker should be aware of
 	Model        string   // desired model, if the adapter supports it
 	Effort       string   // reasoning effort hint
-	Command      []string // for the shell adapter: the command to run
+	// Iteration is the engine's 1-based entry count for this stage. It lets a
+	// deterministic adapter (the fake) vary its output per engine iteration
+	// (e.g. needs_fixes then approved) WITHOUT relying on adapter-internal state,
+	// so it works even when the registry builds a fresh adapter per stage.
+	Iteration int
+	Command   []string // for the shell adapter: the command to run
 	// AllowNonZeroExit makes the shell adapter treat a non-zero exit code as a
 	// normal result instead of a worker failure.
 	AllowNonZeroExit bool
