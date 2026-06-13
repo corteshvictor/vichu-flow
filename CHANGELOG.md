@@ -11,6 +11,13 @@ Refactors), in the spirit of [Keep a Changelog](https://keepachangelog.com).
 
 <!-- release-please will insert released versions below this line. -->
 
+## [0.2.0](https://github.com/corteshvictor/vichu-flow/compare/v0.1.1...v0.2.0) (2026-06-13)
+
+
+### Features
+
+* **engine:** adversarial review→fix loop with codex adapter and hardened resume ([#14](https://github.com/corteshvictor/vichu-flow/issues/14)) ([557ac8f](https://github.com/corteshvictor/vichu-flow/commit/557ac8fdf4cd7891d8c61cb9935843ab136d018d))
+
 ## [0.1.1](https://github.com/corteshvictor/vichu-flow/compare/v0.1.0...v0.1.1) (2026-06-13)
 
 
