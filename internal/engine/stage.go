@@ -15,6 +15,10 @@ import (
 	"github.com/corteshvictor/vichu-flow/internal/workspace"
 )
 
+// warnSaveWorkerStatus is the warn label used wherever a worker status write may
+// fail, kept as one constant so the message stays consistent.
+const warnSaveWorkerStatus = "save worker status"
+
 // runWorkerStage invokes an agent for a stage, capturing its events, result,
 // and the exact set of files it mutated. It returns advance=false (without
 // error) when a budget guard blocks the run.
@@ -69,7 +73,7 @@ func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runS
 		ID: workerID, Role: stage.Role, Adapter: adapter.Name(),
 		Stage: stage.Name, Status: core.WorkerRunning, StartedAt: now,
 	}
-	e.warn(e.store.SaveWorkerStatus(state.RunID, ws), "save worker status")
+	e.warn(e.store.SaveWorkerStatus(state.RunID, ws), warnSaveWorkerStatus)
 	e.warn(e.store.WriteWorkerFile(state.RunID, workerID, "prompt.md", []byte(prompt)), "write worker prompt")
 	state.ActiveWorker = workerID
 	state.NextAction = "running " + stage.Role
@@ -89,18 +93,7 @@ func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runS
 	// their captured output in the audit trail too.
 	e.persistWorkerResult(state.RunID, workerID, result)
 	if err != nil {
-		// A worker killed by cancellation or a budget deadline is canceled, not
-		// done/failed: the audit must reflect what actually happened.
-		if e.canceledOnDisk(state.RunID) {
-			e.markWorker(state, ws, core.WorkerCanceled)
-			return false, nil // the run loop finalizes the canceled state
-		}
-		if ctx.Err() != nil {
-			e.markWorker(state, ws, core.WorkerCanceled)
-			return false, ctx.Err() // the run loop maps deadlines to a budget block
-		}
-		e.markWorker(state, ws, core.WorkerFailed)
-		return false, fmt.Errorf("worker %s: %w", workerID, err)
+		return e.handleWorkerError(ctx, state, ws, workerID, err)
 	}
 	policyBlock := e.trackMutations(state, stage, workerID, rs.baseSHA, tracker)
 
@@ -115,7 +108,7 @@ func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runS
 	ws.Status = core.WorkerDone
 	ws.FinishedAt = &fin
 	ws.SessionID = result.SessionID
-	e.warn(e.store.SaveWorkerStatus(state.RunID, ws), "save worker status")
+	e.warn(e.store.SaveWorkerStatus(state.RunID, ws), warnSaveWorkerStatus)
 	e.emit(state, stage.Name, workerID, core.EventWorkerFinished, map[string]any{"cost_usd": result.CostUSD})
 	if result.TokensIn > 0 || result.TokensOut > 0 {
 		e.emit(state, stage.Name, workerID, "token_usage", map[string]any{
@@ -177,12 +170,11 @@ func (e *Engine) runGate(ctx context.Context, state *core.State, stage workflows
 	e.saveState(state)
 
 	// Track what the gate touches: a verification command should not mutate the
-	// tree. This is the backstop for gates that mutate via an interpreter the
-	// policy can't introspect (e.g. `python -c '...'`). In block mode we also
-	// back up at-risk user work first, so the gate's damage can be rolled back.
-	// Set up the gate-mutation backstop BEFORE running the gate, and refuse to run
-	// if it can't be established: without a backup (block mode) a damaging gate
-	// could not be rolled back, and without tracking the backstop can't detect it.
+	// tree (the backstop for gates that mutate via an interpreter the policy can't
+	// introspect, e.g. `python -c '...'`). Set this up BEFORE running the gate and
+	// refuse to run if it can't be established: without a backup (block mode) a
+	// damaging gate could not be rolled back, and without tracking the backstop
+	// can't detect it.
 	var backup *workspace.Backup
 	var tracker *workspace.Tracker
 	if e.cfg.Security.GateMutations != "allow" {
@@ -391,6 +383,22 @@ func (e *Engine) persistWorkerResult(runID, workerID string, result core.Result)
 	}
 }
 
+// handleWorkerError maps a worker session error to the right terminal outcome —
+// canceled (external cancel or a budget deadline) vs failed — and returns what
+// runWorkerStage should propagate to the run loop.
+func (e *Engine) handleWorkerError(ctx context.Context, state *core.State, ws *core.WorkerStatus, workerID string, err error) (bool, error) {
+	if e.canceledOnDisk(state.RunID) {
+		e.markWorker(state, ws, core.WorkerCanceled)
+		return false, nil // the run loop finalizes the canceled state
+	}
+	if ctx.Err() != nil {
+		e.markWorker(state, ws, core.WorkerCanceled)
+		return false, ctx.Err() // the run loop maps deadlines to a budget block
+	}
+	e.markWorker(state, ws, core.WorkerFailed)
+	return false, fmt.Errorf("worker %s: %w", workerID, err)
+}
+
 func (e *Engine) markWorkerFailed(state *core.State, ws *core.WorkerStatus) {
 	e.markWorker(state, ws, core.WorkerFailed)
 }
@@ -399,7 +407,7 @@ func (e *Engine) markWorker(state *core.State, ws *core.WorkerStatus, status cor
 	fin := time.Now().UTC()
 	ws.Status = status
 	ws.FinishedAt = &fin
-	e.warn(e.store.SaveWorkerStatus(state.RunID, ws), "save worker status")
+	e.warn(e.store.SaveWorkerStatus(state.RunID, ws), warnSaveWorkerStatus)
 }
 
 // checkBudgets returns a non-empty reason if a run-level budget is exhausted.
