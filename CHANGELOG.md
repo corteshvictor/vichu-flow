@@ -11,6 +11,13 @@ Refactors), in the spirit of [Keep a Changelog](https://keepachangelog.com).
 
 <!-- release-please will insert released versions below this line. -->
 
+## [0.2.1](https://github.com/corteshvictor/vichu-flow/compare/v0.2.0...v0.2.1) (2026-06-13)
+
+
+### Bug Fixes
+
+* **engine:** harden v0.2 review loop — cost, isolation, honest gates, safe defaults ([#16](https://github.com/corteshvictor/vichu-flow/issues/16)) ([c42c4ee](https://github.com/corteshvictor/vichu-flow/commit/c42c4eea9857c6fdd29a17ff3950ad68c4612acf))
+
 ## [0.2.0](https://github.com/corteshvictor/vichu-flow/compare/v0.1.1...v0.2.0) (2026-06-13)
 
 
