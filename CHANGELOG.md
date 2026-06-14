@@ -11,6 +11,13 @@ Refactors), in the spirit of [Keep a Changelog](https://keepachangelog.com).
 
 <!-- release-please will insert released versions below this line. -->
 
+## [0.3.0](https://github.com/corteshvictor/vichu-flow/compare/v0.2.1...v0.3.0) (2026-06-14)
+
+
+### Features
+
+* **workspace:** Git-optional runs via providers and project templates ([#18](https://github.com/corteshvictor/vichu-flow/issues/18)) ([486fd57](https://github.com/corteshvictor/vichu-flow/commit/486fd5762a921339297c2f2eecef0c786c13dda2))
+
 ## [0.2.1](https://github.com/corteshvictor/vichu-flow/compare/v0.2.0...v0.2.1) (2026-06-13)
 
 
