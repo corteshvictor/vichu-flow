@@ -55,7 +55,7 @@ Agent CLIs change their flags and output formats constantly; adapters isolate
 all of that churn so it never reaches the engine. Every adapter normalizes its
 agent's output into a common event stream and result.
 
-VichuFlow ships four adapters (the `codex` adapter arrived in v0.2):
+VichuFlow ships four adapters:
 
 - **`claude-code`** — runs workers via the Claude Code CLI in headless mode:
   streamed tool-use events land in the run timeline, cost and token usage are
@@ -86,26 +86,40 @@ command itself and reads the real exit code.
 
 ## Workspace safety and mutation tracking
 
-When a run starts, VichuFlow captures a **workspace snapshot**: the current
-commit, branch, and the uncommitted files *with content fingerprints* (hashes).
-Before and after each worker, it diffs the repository to record exactly which
-files the worker changed — and their resulting hashes — in that worker's
+When a run starts, VichuFlow captures a **workspace snapshot**: a baseline id
+plus the files that already differ from it, *with content fingerprints*
+(hashes). Before and after each worker, it diffs the workspace to record exactly
+which files the worker changed — and their resulting hashes — in that worker's
 `mutations.json`, never trusting the agent's own account.
 
-On **resume**, it compares the live repository's fingerprints to the snapshot
-plus the run's own recorded changes. If anything moved underneath the run — a
-new commit, a new file, an external edit *even to a file the run itself
-touched*, or a vanished change — it blocks with `workspace_drift` instead of
-continuing on an unexpected state.
+On **resume**, it compares the live workspace's fingerprints to the snapshot
+plus the run's own recorded changes. If anything moved underneath the run — the
+baseline moved, a new file appeared, an external edit *even to a file the run
+itself touched*, or a vanished change — it blocks with `workspace_drift` instead
+of continuing on an unexpected state.
 
 Mutations are also **policed**: touching a sensitive file (CI config, VCS
 internals, `vichu.yaml`, lockfiles) blocks the run by default, stages can
 declare scopes, and read-only stages (like `explore`) block on any mutation at
 all. See the `security` block in [configuration.md](configuration.md).
 
-In v0.2, this runs on **Git-backed** repositories (change detection, diffs, and
-rollback use Git). Running in any folder without Git — `workspace.provider:
-auto | git | filesystem` — lands in **v0.3**.
+### Workspace providers — Git is optional
+
+The baseline comes from a **workspace provider**, chosen by
+`workspace.provider: auto | git | filesystem` (default `auto`):
+
+- **`git`** — the repository is the baseline. Change detection, diffs, and
+  rollback use `git status` / `git diff` / `git checkout`. Efficient and tied
+  into your history; the **recommended** path for Git repos.
+- **`filesystem`** — no VCS. On each run start VichuFlow copies the tree (minus
+  `.git/` and `.vichu/`) into a baseline under `.vichu/`, then detects
+  created/modified/deleted files by comparing hashes and rolls back from that
+  copy. Works in **any folder**.
+- **`auto`** — use `git` when the folder is a Git repository, otherwise
+  `filesystem`.
+
+The central guarantee — *know exactly what the agent changed, and be able to
+undo it* — does not depend on Git. Git is one provider, not a requirement.
 
 ## Context pack
 

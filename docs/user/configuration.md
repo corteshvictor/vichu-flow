@@ -60,9 +60,29 @@ workflow:
 
 ```yaml
 workspace:
-  isolation: current-worktree   # v0.1: runs against the current working tree
+  provider: auto                # auto | git | filesystem
+  isolation: current-worktree   # runs against the current working tree
   requireCleanTree: warn        # warn | block | allow
 ```
+
+`provider` selects the workspace backend — how VichuFlow snapshots the tree,
+detects what changed, and rolls back:
+
+- `git` — the Git repository is the baseline (`git status` / `git diff` /
+  `git checkout`). Recommended for Git repos; ties into your history. With
+  `provider: git`, a non-Git folder is an error.
+- `filesystem` — no VCS required. VichuFlow snapshots the tree under `.vichu/`
+  and compares hashes to detect created/modified/deleted files, rolling back
+  from its own copy. Works in any folder.
+- `auto` *(default)* — use `git` when the folder is a Git repository, otherwise
+  fall back to `filesystem`.
+
+Git is recommended but **not required**: the filesystem provider gives the same
+"know what changed + undo it" guarantee without a VCS. `vichu init` works in a
+non-Git folder; pass `--provider git|filesystem|auto` to force one. There is no
+automatic `git init` — to use Git, run `git init` yourself and `auto` detects it.
+
+`requireCleanTree` controls starting with pre-existing changes to the baseline:
 
 - `warn` — start even with uncommitted changes, but log a warning (default).
 - `block` — refuse to start with a dirty tree.
@@ -202,7 +222,7 @@ Enforcement is real, not advisory:
 ```yaml
 security:
   allowGitMutations: false
-  allowNetwork: true          # RESERVED in v0.1 — see note below; not yet enforced
+  allowNetwork: true          # RESERVED — see note below; not yet enforced
   sensitiveMutations: block   # block (default) | warn
   outOfScopeMutations: warn   # warn (default) | block
   gateMutations: block        # block (default) | warn | allow
@@ -240,7 +260,7 @@ working tree:
 - **Read-only stages** (like `explore`): any mutation blocks the run regardless
   of policy — the instruction "do not modify files" is enforced, not just asked.
 
-> **`allowNetwork` is reserved in v0.1.** VichuFlow cannot yet portably isolate
+> **`allowNetwork` is reserved.** VichuFlow cannot yet portably isolate
 > an adapter's or gate's network access, so this flag is **not enforced** — do
 > not rely on it as a guarantee. It is kept for forward compatibility.
 

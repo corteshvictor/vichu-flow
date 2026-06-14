@@ -8,11 +8,11 @@ You do not tag, edit the changelog, or build binaries by hand.
 1. **Commits land on `main`** using the Conventional Commits convention
    (`feat:`, `fix:`, …). See [CONTRIBUTING.md](CONTRIBUTING.md).
 2. **[release-please](https://github.com/googleapis/release-please)** opens (and
-   keeps updating) a **Release PR** titled like `chore(main): release 0.2.0`. It
+   keeps updating) a **Release PR** titled like `chore(main): release X.Y.Z`. It
    computes the next [SemVer](https://semver.org) version from the commit types
    and updates `CHANGELOG.md`.
 3. **You merge the Release PR** when you want to ship. release-please then tags
-   the commit (e.g. `v0.2.0`) and creates the GitHub Release with the changelog
+   the commit (e.g. `vX.Y.Z`) and creates the GitHub Release with the changelog
    notes.
 4. **In the same workflow run**, the `goreleaser` job runs — it is chained to
    release-please with `needs` + `if: release_created == 'true'`, so
@@ -24,8 +24,8 @@ You do not tag, edit the changelog, or build binaries by hand.
 > blocks that to prevent loops). So both steps live in `release.yml` and run in
 > the same workflow run.
 
-That's it — `go install ...@v0.2.0` works immediately, because Go resolves
-versions straight from git tags (no registry to publish to).
+That's it — `go install ...@vX.Y.Z` (or `@latest`) works immediately, because Go
+resolves versions straight from git tags (no registry to publish to).
 
 ## First release (bootstrap)
 

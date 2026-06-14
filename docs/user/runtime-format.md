@@ -11,7 +11,7 @@ documents the layout and schemas for `schema_version: 1`.
   state.json              # source of truth (atomic writes)
   events.ndjson           # append-only timeline
   lock.json               # owner pid + hostname + heartbeat
-  workspace.json          # git snapshot captured at start
+  workspace.json          # workspace snapshot captured at start (git or filesystem)
   contextpack.md          # project context injected into workers
   config.snapshot.yaml    # frozen config for this run
   workers/<worker-id>/
@@ -31,6 +31,12 @@ documents the layout and schemas for `schema_version: 1`.
   summaries/<stage>.md    # bounded per-stage summary passed to later stages
   artifacts/              # workflow artifacts
 ```
+
+With the `filesystem` workspace provider, a sibling `.vichu/baseline/` holds the
+tree copy that run snapshots are taken against (plus `baseline.manifest` and
+`baseline.id`); the `git` provider uses the repository itself and writes no
+baseline. Either way, everything under `.vichu/` is runtime bookkeeping — it is
+gitignored, never counted as a worker mutation, and safe to delete between runs.
 
 ## state.json
 
@@ -95,14 +101,22 @@ can be reclaimed — this is how an interrupted run is safely resumed.
 ## workspace.json
 
 ```json
-{ "isolation": "current-worktree", "branch": "main", "base_sha": "55728672...",
+{ "provider": "git", "isolation": "current-worktree", "branch": "main",
+  "base_sha": "55728672...",
   "dirty_files": ["notes.md"],
   "fingerprints": { "notes.md": "9f86d081..." },
   "captured_at": "..." }
 ```
 
-`fingerprints` maps each dirty path to its sha256 content hash at snapshot time;
-drift detection on resume compares content, not just file names.
+`provider` is the workspace backend this run was snapshotted with (`git` or
+`filesystem`); resume reopens that same backend so a folder that later gains (or
+loses) a `.git` can't silently flip provider and trigger avoidable drift.
+`base_sha` identifies the baseline the snapshot was taken against. Its form
+depends on the provider ([configuration.md](configuration.md)): the `git`
+provider records the HEAD commit (and `branch`), while the `filesystem` provider
+records a content digest prefixed `fs:` (and leaves `branch` empty).
+`fingerprints` maps each changed-vs-baseline path to its sha256 content hash at
+snapshot time; drift detection on resume compares content, not just file names.
 
 ## verdict.json (gate evidence)
 

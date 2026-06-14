@@ -14,9 +14,9 @@ agents from the outside, and **decides stage transitions from evidence it
 verifies itself** — running your tests, lint, and typecheck — never from the
 agent's own say-so.
 
-> **Adapter status:** v0.2 ships the `claude-code`, `codex`, `shell`, and `fake`
-> adapters. More agents (OpenCode, Gemini CLI) are designed for through the same
-> contract and land on the roadmap.
+> **Adapter status:** VichuFlow ships the `claude-code`, `codex`, `shell`, and
+> `fake` adapters. More agents (OpenCode, Gemini CLI) are planned through the
+> same contract.
 
 ## Why VichuFlow?
 
@@ -31,9 +31,10 @@ an **external runtime that doesn't trust the agent**.
   is blocked, with the evidence on disk.
 - **It survives crashes.** A run is plain files (`state.json` + `events.ndjson`).
   Kill it, reboot, `vichu resume` — it picks up where it stopped.
-- **It won't wreck your work.** Git snapshots, per-worker mutation tracking, a
-  command policy that blocks `rm -rf`/`git push`/installs before they run, and
-  automatic rollback if a check touches your files.
+- **It won't wreck your work.** Workspace snapshots (Git or filesystem),
+  per-worker mutation tracking, a command policy that blocks `rm -rf`/`git
+  push`/installs before they run, and automatic rollback if a check touches your
+  files.
 - **It won't burn your budget.** Hard limits on wall-clock, cost, and tokens
   (summed across every agent) stop runaway loops and surprise bills.
 - **It's vendor-neutral.** Implement with one agent, review with another — or
@@ -55,18 +56,24 @@ Three ideas hold it together:
 
 ## Status
 
-**Current release: v0.2.0.** It ships:
+The latest release is shown by the **Release badge** above; the version is
+tracked by git tags and `CHANGELOG.md`, not hardcoded here. The current build
+ships:
 
-- `vichu init`, `doctor`, `run`, `status [--watch]`, `resume`, `cancel`, `adapters`, `config`
+- `vichu init [--template]`, `new`, `doctor`, `run`, `status [--watch]`, `resume`, `cancel`, `adapters`, `config`
+- **Project templates** (`vichu new <name> --template go|node|python|rust|empty`, or `vichu init --template`): scaffold a runnable project with a real gate, so the first run completes from scratch — Git optional
 - Persistent runtime: atomic `state.json`, append-only `events.ndjson`, heartbeat locks with orphan reclaim, cooperative cancel
 - `quick` workflow (explore → implement → verify) and **`review`** workflow (an adversarial review → auto-fix loop that branches on a structured, persisted verdict)
 - Adapters: **`claude-code`** and **`codex`** (headless, streamed events, session resume), `shell`, and `fake` (deterministic, for CI)
-- Verified gates, git workspace snapshots with content fingerprints, per-worker mutation tracking, and enforced mutation policy (sensitive files block, read-only stages enforced)
+- **Workspace providers** — `git` or `filesystem` (`workspace.provider: auto`), so runs work with or without a VCS (see below)
+- Verified gates, workspace snapshots with content fingerprints, per-worker mutation tracking, and enforced mutation policy (sensitive files block, read-only stages enforced)
 
-> **Current limitation:** v0.2 works on **Git-backed** repositories — change
-> detection, diffs, and rollback use Git, so a project needs to be a Git repo.
-> Filesystem-only workspaces (running in any folder, no Git required) land in
-> **v0.3** via `workspace.provider: auto | git | filesystem`.
+> **Works with or without Git** (v0.3). `workspace.provider: auto | git |
+> filesystem` (default `auto`): on a Git repo VichuFlow uses Git as the baseline;
+> in any other folder it snapshots the tree under `.vichu/` — so change
+> detection, mutation tracking, and rollback work the same way, **no VCS
+> required**. Git stays the recommended path for Git repos; it is no longer a
+> requirement of the runtime.
 
 The architecture is documented in [Concepts](docs/user/concepts.md) and the
 [runtime format](docs/user/runtime-format.md).
@@ -90,23 +97,44 @@ go install github.com/corteshvictor/vichu-flow/cmd/vichu@latest   # Go 1.26+
 # or:  git clone … && cd vichu-flow && go build -o vichu ./cmd/vichu
 ```
 
-> **VichuFlow itself** needs only `git` at runtime — no Go, no other runtime.
-> But the **verification commands you configure** (test/lint/typecheck) run with
-> your project's own toolchain: a Python gate needs Python, a Node gate needs
-> Node, `cargo test` needs Rust, and so on. VichuFlow runs your commands; it
-> doesn't bundle the toolchains they call.
+> **VichuFlow itself** needs no runtime — no Go, no Git. Git is recommended (the
+> `git` provider is efficient and ties into your history) but optional: in a
+> non-Git folder the `filesystem` provider gives the same undo guarantees. The
+> **verification commands you configure** (test/lint/typecheck) do run with your
+> project's own toolchain: a Python gate needs Python, a Node gate needs Node,
+> `cargo test` needs Rust, and so on. VichuFlow runs your commands; it doesn't
+> bundle the toolchains they call.
 
 ## Quick start
 
+**New project** — scaffold runnable source plus a real gate, then run:
+
 ```bash
-cd your-git-repo
-vichu init                        # detect stack, write vichu.yaml, ignore .vichu/
-vichu run "add a hello function"  # run the default workflow
-vichu status                      # inspect the latest run
+vichu new my-app --template go     # or: empty | node | python | rust
+cd my-app
+vichu run "add a sum function"     # → completed (gate: go test ./...)
+vichu status                       # inspect the latest run
 ```
 
-By default a fresh project uses the `fake` adapter, so `vichu run` works out of
-the box with **no agent CLI installed**. To use a real agent, install the
+**Existing project** — initialize in place:
+
+```bash
+cd your-project                    # a Git repo, or any folder — Git is optional
+vichu init                         # detect stack, write vichu.yaml, ignore .vichu/
+vichu run "add a hello function"   # (or `vichu init --template node` to seed one)
+```
+
+Each template seeds minimal source plus a real gate using the stack's built-in
+test runner (no package install), so the **very first run completes** — with or
+without Git. By default a fresh project uses the `fake` adapter, so `vichu run`
+works with **no agent CLI installed**.
+
+A run reaches `completed` only when a verification gate passes: `vichu init`
+wires up the gates it detects for your stack (`go test`, `npm test`, …). An
+**empty folder has no gate**, so the run honestly **blocks at `verify`** instead
+of faking success — which is exactly why `vichu new` / `--template` seed one.
+
+To use a real agent, install the
 [Claude Code CLI](https://www.anthropic.com/claude-code) and set the `agents`
 block in `vichu.yaml`:
 
