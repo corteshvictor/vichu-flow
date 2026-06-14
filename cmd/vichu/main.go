@@ -25,6 +25,7 @@ type command struct {
 func commands() []command {
 	return []command{
 		{"init", "cmd.init", cmdInit},
+		{"new", "cmd.new", cmdNew},
 		{"doctor", "cmd.doctor", cmdDoctor},
 		{"run", "cmd.run", cmdRun},
 		{"status", "cmd.status", cmdStatus},

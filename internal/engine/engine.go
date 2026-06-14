@@ -29,7 +29,7 @@ type Engine struct {
 	store    *runtime.Store
 	registry *adapters.Registry
 	cfg      *config.Config
-	repo     *workspace.Repo
+	repo     workspace.Provider
 	gates    *gates.Runner
 	policy   security.Policy
 	log      func(string)
@@ -40,7 +40,7 @@ type Options struct {
 	Store    *runtime.Store
 	Registry *adapters.Registry
 	Config   *config.Config
-	Repo     *workspace.Repo
+	Repo     workspace.Provider
 	Log      func(string) // optional progress sink for the CLI
 }
 
@@ -190,11 +190,8 @@ func (e *Engine) Resume(ctx context.Context, runID string, opts ResumeOptions) (
 		return nil, err
 	}
 
-	handle, err := e.store.AcquireLock(runID)
+	handle, err := e.acquireForResume(runID)
 	if err != nil {
-		if errors.Is(err, runtime.ErrLocked) {
-			return nil, fmt.Errorf("run %s is already being executed by a live process — cancel it with `vichu cancel %s` or wait for it to finish", runID, runID)
-		}
 		return nil, err
 	}
 	defer func() { _ = handle.Release() }()
@@ -203,24 +200,15 @@ func (e *Engine) Resume(ctx context.Context, runID string, opts ResumeOptions) (
 	if err != nil {
 		return nil, fmt.Errorf("loading workspace snapshot: %w", err)
 	}
-	if drifted, reason := e.checkDrift(runID, snap); drifted {
-		if !opts.AcceptChanges {
-			e.emit(state, "", "", core.EventWorkspaceDrift, map[string]any{"reason": reason})
-			e.block(state, "workspace_drift: "+reason)
-			e.log(i18n.T("engine.drift_hint", runID))
-			return state, nil
-		}
-		// Explicitly accepted: re-baseline the snapshot to the current tree.
-		fresh, err := e.repo.Snapshot(snap.Isolation)
-		if err != nil {
-			return nil, fmt.Errorf("re-baselining workspace: %w", err)
-		}
-		if err := e.store.SaveWorkspace(runID, fresh); err != nil {
-			return nil, err
-		}
-		snap = fresh
-		e.emit(state, "", "", "workspace_rebaselined", map[string]any{"reason": reason})
-		e.log(i18n.T("engine.rebaselined"))
+	if err := e.reopenProviderForResume(snap); err != nil {
+		return nil, err
+	}
+	snap, blocked, err := e.resolveDrift(state, runID, snap, opts)
+	if err != nil {
+		return nil, err
+	}
+	if blocked {
+		return state, nil
 	}
 
 	state.Status = core.StatusActive
@@ -246,6 +234,64 @@ func (e *Engine) Resume(ctx context.Context, runID string, opts ResumeOptions) (
 		resumeSession: resumeSession,
 	}
 	return e.runWithHeartbeat(ctx, handle, state, rs)
+}
+
+// acquireForResume takes the run lock, translating a live-owner conflict into an
+// actionable message.
+func (e *Engine) acquireForResume(runID string) (*runtime.Handle, error) {
+	handle, err := e.store.AcquireLock(runID)
+	if err != nil {
+		if errors.Is(err, runtime.ErrLocked) {
+			return nil, fmt.Errorf("run %s is already being executed by a live process — cancel it with `vichu cancel %s` or wait for it to finish", runID, runID)
+		}
+		return nil, err
+	}
+	return handle, nil
+}
+
+// reopenProviderForResume switches e.repo back to the backend the run started
+// with, so a folder that gained (or lost) a .git since the run began can't flip
+// the `auto` provider and report avoidable drift against a different baseline.
+// It reopens at the project root (where .vichu lives), not e.repo.Root(): when
+// `auto` resolves git, the Repo re-roots to the git top level, which can sit
+// ABOVE the project root — reopening there would miss the filesystem baseline.
+func (e *Engine) reopenProviderForResume(snap *core.Workspace) error {
+	if snap.Provider == "" || snap.Provider == e.repo.Kind() {
+		return nil
+	}
+	reopened, err := workspace.Open(e.store.ProjectRoot(), snap.Provider)
+	if err != nil {
+		return fmt.Errorf("reopening %s workspace for resume: %w", snap.Provider, err)
+	}
+	e.repo = reopened
+	return nil
+}
+
+// resolveDrift checks for workspace drift on resume. If the live workspace
+// diverged and the caller did not accept it, it blocks the run and returns
+// blocked=true. If accepted, it re-baselines and returns the fresh snapshot.
+func (e *Engine) resolveDrift(state *core.State, runID string, snap *core.Workspace, opts ResumeOptions) (*core.Workspace, bool, error) {
+	drifted, reason := e.checkDrift(runID, snap)
+	if !drifted {
+		return snap, false, nil
+	}
+	if !opts.AcceptChanges {
+		e.emit(state, "", "", core.EventWorkspaceDrift, map[string]any{"reason": reason})
+		e.block(state, "workspace_drift: "+reason)
+		e.log(i18n.T("engine.drift_hint", runID))
+		return snap, true, nil
+	}
+	// Explicitly accepted: re-baseline the snapshot to the current tree.
+	fresh, err := e.repo.Snapshot(snap.Isolation)
+	if err != nil {
+		return nil, false, fmt.Errorf("re-baselining workspace: %w", err)
+	}
+	if err := e.store.SaveWorkspace(runID, fresh); err != nil {
+		return nil, false, err
+	}
+	e.emit(state, "", "", "workspace_rebaselined", map[string]any{"reason": reason})
+	e.log(i18n.T("engine.rebaselined"))
+	return fresh, false, nil
 }
 
 // lastSummaryOnDisk restores prompt continuity across resumes: the summary of

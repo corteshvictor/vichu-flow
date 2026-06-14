@@ -342,7 +342,7 @@ func (e *Engine) rollbackGate(state *core.State, stage string, backup *workspace
 			fromHEAD = append(fromHEAD, m.Path)
 		}
 	}
-	if n, err := e.repo.RestoreFromHEAD(fromHEAD); err != nil {
+	if n, err := e.repo.RestoreBaseline(fromHEAD); err != nil {
 		e.emit(state, stage, "", "gate_rollback_failed", map[string]any{"error": err.Error(), "paths": fromHEAD})
 	} else {
 		restored += n
@@ -426,7 +426,7 @@ func (e *Engine) checkGateMutations(state *core.State, stage string, n int, trac
 	}
 	report := &core.MutationReport{
 		Worker: fmt.Sprintf("gate:%s:%d", stage, n), Stage: stage,
-		BaseSHA: e.repo.HeadSHA(), Mutations: muts, CapturedAt: time.Now().UTC(),
+		BaseSHA: e.repo.BaseID(), Mutations: muts, CapturedAt: time.Now().UTC(),
 	}
 	e.warn(e.store.SaveGateMutationReport(state.RunID, stage, n, report), "save gate mutation report")
 	e.emit(state, stage, "", "gate_mutation", map[string]any{"gate_n": n, "count": len(muts)})
@@ -592,7 +592,7 @@ func (e *Engine) checkBudgets(state *core.State) string {
 // the working tree that differs from that — a new file, an external edit to a
 // file the run touched, or a vanished change — is drift.
 func (e *Engine) checkDrift(runID string, snap *core.Workspace) (bool, string) {
-	if head := e.repo.HeadSHA(); head != snap.BaseSHA {
+	if head := e.repo.BaseID(); head != snap.BaseSHA {
 		return true, "base commit changed since the run started"
 	}
 	current, err := e.repo.FingerprintChanged()

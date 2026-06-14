@@ -19,6 +19,13 @@ func DefaultYAML(d Detected, projectName string) string {
 		return v
 	}
 
+	// The test gate is per-OS when a template supplies a distinct Windows command;
+	// otherwise it is a single cross-platform string.
+	testBlock := fmt.Sprintf("  test: %q", cmd(d.TestCmd))
+	if d.TestCmdWindows != "" && d.TestCmdWindows != d.TestCmd {
+		testBlock = fmt.Sprintf("  test:\n    unix: %q\n    windows: %q", cmd(d.TestCmd), d.TestCmdWindows)
+	}
+
 	var b strings.Builder
 	fmt.Fprintf(&b, `# VichuFlow project configuration. Docs: docs/user/configuration.md
 project:
@@ -39,7 +46,8 @@ workflow:
   requireGates: true       # block (don't "complete") if no verify gates are configured; set false for demo/fake
 
 workspace:
-  isolation: current-worktree   # git required; agents write to the current worktree
+  provider: auto                # auto | git | filesystem — git when the folder is a repo, else snapshot under .vichu/
+  isolation: current-worktree   # agents write to the current worktree
   requireCleanTree: warn        # warn | block | allow
 
 observability:
@@ -62,7 +70,7 @@ agents:
 # Verification commands VichuFlow runs itself to gate stage transitions. Each
 # may be a single string or a {unix, windows} map. "auto" disables the gate.
 commands:
-  test: %q
+%s
   lint: %q
   typecheck: %q
 
@@ -84,7 +92,7 @@ budgets:
 
 security:
   allowGitMutations: false
-  allowNetwork: true            # RESERVED in v0.1 — not yet enforced (no portable network isolation)
+  allowNetwork: true            # RESERVED — not yet enforced (no portable network isolation)
   sensitiveMutations: block     # block | warn — worker touches CI/VCS/config/lockfiles
   outOfScopeMutations: warn     # warn | block — worker touches files outside stage scope
   gateMutations: block          # block | warn | allow — a gate changes/deletes an existing tracked or pre-existing untracked file (rolled back on block)
@@ -95,6 +103,6 @@ security:
 
 # Extra project conventions to inject into every worker's context pack.
 conventions: []
-`, projectName, lang, cmd(d.TestCmd), cmd(d.LintCmd), cmd(d.TypecheckCmd))
+`, projectName, lang, testBlock, cmd(d.LintCmd), cmd(d.TypecheckCmd))
 	return b.String()
 }

@@ -21,42 +21,76 @@ func cmdDoctor(args []string) error {
 
 	fmt.Printf(i18n.T("doctor.header")+"\n\n", runtime.GOOS, runtime.GOARCH, runtime.Version())
 
-	ok := true
-	check := func(label string, pass bool, detail string) {
-		mark := "✓"
-		if !pass {
-			mark = "✗"
-			ok = false
-		}
-		fmt.Printf("  %s %-22s %s\n", mark, label, detail)
-	}
-	// warn surfaces an advisory (e.g. an unbounded budget) without failing doctor.
-	warn := func(label, detail string) {
-		fmt.Printf("  ! %-22s %s\n", label, detail)
-	}
+	d := &doctorReport{ok: true}
+	d.gitCheck()
+	d.projectChecks()
+	printAdapters()
 
-	// Git is the hard requirement.
-	gitOK := workspace.GitAvailable()
-	check("git", gitOK, gitDetail(gitOK))
-
-	// Project config + repo.
-	root, rootErr := findRoot()
-	if rootErr != nil {
-		check("vichu.yaml", false, i18n.T("doctor.no_config"))
+	fmt.Println()
+	if d.ok {
+		fmt.Println(i18n.T("doctor.all_ok"))
 	} else {
-		check("vichu.yaml", true, filepath.Join(root, config.FileName))
-		if _, err := workspace.Detect(root); err != nil {
-			check("git repository", false, err.Error())
-		} else {
-			check("git repository", true, root)
-		}
-		// Nudge older configs (pre-v0.2.1) whose token budget is still unlimited.
-		if cfg, err := config.Load(filepath.Join(root, config.FileName)); err == nil && cfg.Budgets.Run.MaxTotalTokens == 0 {
-			warn("token budget", i18n.T("doctor.tokens_unlimited"))
-		}
+		fmt.Println(i18n.T("doctor.failures"))
 	}
+	return nil
+}
 
-	// Adapters.
+// doctorReport tracks whether all required checks passed and renders each line.
+type doctorReport struct{ ok bool }
+
+// check renders a pass/fail line and records a failure on the report.
+func (d *doctorReport) check(label string, pass bool, detail string) {
+	mark := "✓"
+	if !pass {
+		mark = "✗"
+		d.ok = false
+	}
+	fmt.Printf("  %s %-22s %s\n", mark, label, detail)
+}
+
+// warn renders an advisory (e.g. an unbounded budget) without failing doctor.
+func (d *doctorReport) warn(label, detail string) {
+	fmt.Printf("  ! %-22s %s\n", label, detail)
+}
+
+// gitCheck reports git as a recommendation, not a requirement: the filesystem
+// provider gives the same undo guarantees without a VCS, so a missing git is an
+// advisory, not a failure.
+func (d *doctorReport) gitCheck() {
+	if workspace.GitAvailable() {
+		d.check("git", true, gitDetail(true))
+		return
+	}
+	d.warn("git", i18n.T("doctor.git_missing"))
+}
+
+// projectChecks validates the project config and resolves its workspace provider.
+func (d *doctorReport) projectChecks() {
+	root, err := findRoot()
+	if err != nil {
+		d.check("vichu.yaml", false, i18n.T("doctor.no_config"))
+		return
+	}
+	d.check("vichu.yaml", true, filepath.Join(root, config.FileName))
+
+	cfg, cfgErr := config.Load(filepath.Join(root, config.FileName))
+	mode := config.WorkspaceAuto
+	if cfgErr == nil && cfg.Workspace.Provider != "" {
+		mode = cfg.Workspace.Provider
+	}
+	if prov, err := workspace.Open(root, mode); err != nil {
+		d.check("workspace", false, err.Error())
+	} else {
+		d.check("workspace", true, fmt.Sprintf("%s (%s)", prov.Kind(), prov.Root()))
+	}
+	// Nudge older configs (pre-v0.2.1) whose token budget is still unlimited.
+	if cfgErr == nil && cfg.Budgets.Run.MaxTotalTokens == 0 {
+		d.warn("token budget", i18n.T("doctor.tokens_unlimited"))
+	}
+}
+
+// printAdapters probes each registered adapter and reports its availability.
+func printAdapters() {
 	fmt.Println("\n  " + i18n.T("doctor.adapters"))
 	reg := adapters.DefaultRegistry()
 	for _, name := range sortedNames(reg) {
@@ -66,22 +100,12 @@ func cmdDoctor(args []string) error {
 			continue
 		}
 		av, _ := a.Probe(context.Background())
-		mark := "✓"
-		detail := av.Version
+		mark, detail := "✓", av.Version
 		if !av.Available {
-			mark = "—"
-			detail = av.Reason
+			mark, detail = "—", av.Reason
 		}
 		fmt.Printf("    %s %-12s %s\n", mark, name, detail)
 	}
-
-	fmt.Println()
-	if ok {
-		fmt.Println(i18n.T("doctor.all_ok"))
-	} else {
-		fmt.Println(i18n.T("doctor.failures"))
-	}
-	return nil
 }
 
 func gitDetail(ok bool) string {

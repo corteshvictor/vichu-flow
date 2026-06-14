@@ -32,6 +32,9 @@ func Detect(dir string) (*Repo, error) {
 // Root returns the repository top-level directory.
 func (r *Repo) Root() string { return r.root }
 
+// Kind names this backend; it satisfies Provider.Kind.
+func (r *Repo) Kind() string { return KindGit }
+
 // Snapshot captures the current git state: base commit, branch, and the set of
 // dirty paths. It is persisted to workspace.json and compared on resume.
 func (r *Repo) Snapshot(isolation string) (*core.Workspace, error) {
@@ -53,6 +56,7 @@ func (r *Repo) Snapshot(isolation string) (*core.Workspace, error) {
 	}
 	sort.Strings(dirty)
 	return &core.Workspace{
+		Provider:     KindGit,
 		Isolation:    isolation,
 		Branch:       branch,
 		BaseSHA:      base,
@@ -106,17 +110,19 @@ func (r *Repo) Drifted(snap *core.Workspace) (bool, string, error) {
 	return false, "", nil
 }
 
-// HeadSHA returns the current HEAD commit, or "" on an unborn branch.
-func (r *Repo) HeadSHA() string {
+// BaseID returns the baseline this workspace measures change against — the
+// current HEAD commit, or "" on an unborn branch. It satisfies Provider.BaseID.
+func (r *Repo) BaseID() string {
 	sha, _ := r.git(gitRevParse, "HEAD")
 	return sha
 }
 
-// RestoreFromHEAD restores tracked files to their committed (HEAD) content,
+// RestoreBaseline restores tracked files to their committed (HEAD) content,
 // recreating ones that were deleted and reverting ones that were modified. Used
 // to roll back a blocking gate's damage to files that were tracked-and-clean
-// (so not held in a content backup). Returns how many paths were restored.
-func (r *Repo) RestoreFromHEAD(paths []string) (int, error) {
+// (so not held in a content backup). Returns how many paths were restored. It
+// satisfies Provider.RestoreBaseline.
+func (r *Repo) RestoreBaseline(paths []string) (int, error) {
 	if len(paths) == 0 {
 		return 0, nil
 	}

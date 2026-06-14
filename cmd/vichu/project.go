@@ -18,7 +18,7 @@ type project struct {
 	root  string
 	cfg   *config.Config
 	store *runtime.Store
-	repo  *workspace.Repo
+	repo  workspace.Provider
 }
 
 // findRoot walks up from the current directory to the nearest vichu.yaml.
@@ -40,8 +40,8 @@ func findRoot() (string, error) {
 	}
 }
 
-// openProject loads config and verifies git for the project rooted at the
-// nearest vichu.yaml.
+// openProject loads config and resolves the workspace provider for the project
+// rooted at the nearest vichu.yaml (git, filesystem, or auto).
 func openProject() (*project, error) {
 	root, err := findRoot()
 	if err != nil {
@@ -52,7 +52,7 @@ func openProject() (*project, error) {
 		return nil, err
 	}
 	i18n.SetLanguage(cfg.UI.Language)
-	repo, err := workspace.Detect(root)
+	repo, err := workspace.Open(root, cfg.Workspace.Provider)
 	if err != nil {
 		return nil, err
 	}
