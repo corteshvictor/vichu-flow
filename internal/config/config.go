@@ -70,9 +70,20 @@ func (w WorkflowConfig) GatesRequired() bool {
 }
 
 type WorkspaceConfig struct {
+	// Provider selects the workspace backend: "git" (require a git repo),
+	// "filesystem" (snapshot the tree under .vichu/, no VCS), or "auto" (use git
+	// when the folder is a repo, otherwise fall back to filesystem). Default auto.
+	Provider         string `yaml:"provider"`
 	Isolation        string `yaml:"isolation"`        // current-worktree
 	RequireCleanTree string `yaml:"requireCleanTree"` // warn | block | allow
 }
+
+// Workspace provider modes.
+const (
+	WorkspaceAuto       = "auto"
+	WorkspaceGit        = "git"
+	WorkspaceFilesystem = "filesystem"
+)
 
 type ObservabilityConfig struct {
 	TUI         bool `yaml:"tui"`
@@ -191,6 +202,7 @@ func (c *Config) applyDefaults() {
 	defaultStr(&c.Workflow.Default, "quick")
 	defaultInt(&c.Workflow.MaxAutoIterations, 5)
 	defaultStr(&c.Workflow.ReviewContext, "diff-only")
+	defaultStr(&c.Workspace.Provider, WorkspaceAuto)
 	defaultStr(&c.Workspace.Isolation, "current-worktree")
 	defaultStr(&c.Workspace.RequireCleanTree, "warn")
 	defaultInt(&c.Observability.WebPort, 3737)

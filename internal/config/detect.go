@@ -12,6 +12,10 @@ type Detected struct {
 	Language       string
 	PackageManager string
 	TestCmd        string
+	// TestCmdWindows, when set and different from TestCmd, makes the test gate
+	// per-OS in the generated config — used by templates whose gate needs a
+	// different command on Windows (e.g. the empty template's shell script).
+	TestCmdWindows string
 	LintCmd        string
 	TypecheckCmd   string
 }

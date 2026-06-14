@@ -1,7 +1,9 @@
-// Package workspace enforces git safety for runs: it captures a snapshot of the
-// repository when a run starts, detects drift on resume, and tracks exactly
-// which files each worker mutates. Git is a hard requirement in v0.1 — agents
-// writing code without version control have no undo.
+// Package workspace gives runs an undo guarantee: it snapshots the workspace
+// when a run starts, detects drift on resume, and tracks exactly which files
+// each worker mutates. It is provider-based (see Provider): the Git provider
+// uses the repository as the baseline, and the filesystem provider keeps a
+// content copy under .vichu/ — so Git is recommended but not required, and a run
+// in any folder still has a verifiable record of and a rollback for every change.
 package workspace
 
 import (

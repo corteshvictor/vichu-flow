@@ -12,11 +12,15 @@ const (
 	IsolationTempClone = "temp-clone"
 )
 
-// Workspace is the git snapshot captured when a run starts, persisted to
+// Workspace is the snapshot captured when a run starts, persisted to
 // workspace.json. On resume, a mismatch between this snapshot (plus the run's
-// own recorded mutations) and the live repo state means workspace drift and
+// own recorded mutations) and the live workspace state means workspace drift and
 // blocks the run.
 type Workspace struct {
+	// Provider is the workspace backend this run was snapshotted with ("git" or
+	// "filesystem"). Resume reopens the same backend so a folder that later gains
+	// (or loses) a .git can't silently flip provider and trigger avoidable drift.
+	Provider   string   `json:"provider,omitempty"`
 	Isolation  string   `json:"isolation"`
 	Branch     string   `json:"branch"`
 	BaseSHA    string   `json:"base_sha"`

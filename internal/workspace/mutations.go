@@ -19,27 +19,40 @@ type changedFile struct {
 	hash string
 }
 
+// changeSource is the provider-specific machinery a Tracker needs to compute a
+// worker's mutations: the current changed-vs-baseline fileset, per-path line
+// stats, and the workspace root. Both the Git Repo and the FilesystemWorkspace
+// satisfy it, so Tracker/Backup are shared across providers.
+type changeSource interface {
+	Root() string
+	captureChanged() (map[string]changedFile, error)
+	lineStats(path string, untracked bool) (added, deleted int)
+}
+
 // Tracker captures the working tree before a worker runs and diffs it after, so
 // the runtime knows exactly which files the worker mutated — never trusting the
 // agent's own account.
 type Tracker struct {
-	repo   *Repo
+	src    changeSource
 	before map[string]changedFile
 }
 
 // BeginTracking snapshots the set of changed files before a worker runs.
-func (r *Repo) BeginTracking() (*Tracker, error) {
-	before, err := r.captureChanged()
+func (r *Repo) BeginTracking() (*Tracker, error) { return newTracker(r) }
+
+// newTracker captures the changed set from any provider as the before-state.
+func newTracker(src changeSource) (*Tracker, error) {
+	before, err := src.captureChanged()
 	if err != nil {
 		return nil, err
 	}
-	return &Tracker{repo: r, before: before}, nil
+	return &Tracker{src: src, before: before}, nil
 }
 
 // Finish diffs the working tree against the start snapshot and returns the
 // mutations the worker produced.
 func (t *Tracker) Finish() ([]core.Mutation, error) {
-	after, err := t.repo.captureChanged()
+	after, err := t.src.captureChanged()
 	if err != nil {
 		return nil, err
 	}
@@ -63,16 +76,16 @@ func (t *Tracker) Finish() ([]core.Mutation, error) {
 		a, okA := after[p]
 		switch {
 		case !okB && okA:
-			muts = append(muts, t.repo.mutation(p, a.code, a.hash))
+			muts = append(muts, mutation(t.src, p, a.code, a.hash))
 		case okB && okA && b.hash != a.hash:
-			muts = append(muts, t.repo.mutation(p, a.code, a.hash))
+			muts = append(muts, mutation(t.src, p, a.code, a.hash))
 		case okB && !okA:
-			// The path differed from HEAD before but no longer appears in git
-			// status. Two cases: the working-tree file was deleted (it is gone
+			// The path differed from the baseline before but no longer appears as
+			// changed. Two cases: the working-tree file was deleted (it is gone
 			// from disk now — a real destructive change, including untracked
 			// files that are real user work), or a tracked file was reverted to
-			// HEAD (still on disk — benign). Only the former is a mutation.
-			if !fileExists(filepath.Join(t.repo.root, p)) {
+			// the baseline (still on disk — benign). Only the former is a mutation.
+			if !fileExists(filepath.Join(t.src.Root(), p)) {
 				muts = append(muts, core.Mutation{
 					Path:      p,
 					Kind:      core.MutationDeleted,
@@ -85,9 +98,9 @@ func (t *Tracker) Finish() ([]core.Mutation, error) {
 	return muts, nil
 }
 
-func (r *Repo) mutation(path, code, hash string) core.Mutation {
+func mutation(src changeSource, path, code, hash string) core.Mutation {
 	kind := kindFromCode(code)
-	added, deleted := r.lineStats(path, kind == core.MutationUntracked)
+	added, deleted := src.lineStats(path, kind == core.MutationUntracked)
 	return core.Mutation{
 		Path:      path,
 		Kind:      kind,

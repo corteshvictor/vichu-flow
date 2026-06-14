@@ -4,9 +4,11 @@ This walks you through your first VichuFlow run in about five minutes.
 
 ## Prerequisites
 
-- **Git.** VichuFlow requires a git repository — agents writing code without
-  version control have no undo. `vichu init` and `vichu run` refuse to run
-  outside one.
+- **Git is optional, recommended.** On a Git repo VichuFlow uses Git as the
+  workspace baseline; in any other folder the `filesystem` provider snapshots
+  the tree under `.vichu/` instead — either way an agent's work is tracked and
+  reversible. Pick the backend with `workspace.provider: auto | git | filesystem`
+  (default `auto`). See [configuration.md](configuration.md#workspace).
 - **The VichuFlow binary needs nothing else** — not Go, not any runtime. It works
   on any project (Node, Python, Rust, Go, mixed).
 - **Your project's toolchain**, though, is still needed for the gates: the
@@ -31,7 +33,7 @@ vichu version
 
 ## 2. Initialize a project
 
-From inside any git repository:
+From inside any project folder (a Git repo, or any directory — Git is optional):
 
 ```bash
 vichu init
@@ -68,6 +70,21 @@ Run run-20260610-041723-222a
   budget:   2 agent call(s), $0.00, 0s, 0 tokens
 ```
 
+> **Empty folder?** A run reaches `completed` only when a verification gate
+> passes. With no detectable stack, `vichu init` configures no gates, so
+> `vichu run` honestly **blocks at `verify`** rather than claim success without
+> verification — that is by design, not a failure. To start from nothing with a
+> gate already wired up, scaffold from a template:
+>
+> ```bash
+> vichu new my-app --template go     # empty | go | node | python | rust
+> cd my-app && vichu run "add a sum function"   # → completed
+> # or, in the current folder:  vichu init --template python
+> ```
+>
+> Each template seeds minimal source plus a real gate using the stack's built-in
+> test runner (no package install needed), so the first run completes.
+
 ## 4. Inspect the run
 
 ```bash
@@ -87,9 +104,9 @@ If a verification gate fails, the run stops in `blocked` state with the reason,
 a pointer to the gate's full `output.log`, and a bounded `excerpt.txt` next to
 it with the tail of the failure.
 
-Resume guards against **workspace drift**: if the repository changed underneath
-the run (a new commit, or an edit the run itself didn't make — including to a
-file a worker touched), plain `vichu resume` blocks rather than working on an
+Resume guards against **workspace drift**: if the workspace changed underneath
+the run (the baseline moved, or an edit the run itself didn't make — including to
+a file a worker touched), plain `vichu resume` blocks rather than working on an
 unexpected state. If the external change was you fixing the problem by hand,
 accept it explicitly:
 

@@ -17,6 +17,8 @@ import (
 func cmdInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	force := fs.Bool("force", false, i18n.T("init.flag_force"))
+	provider := fs.String("provider", config.WorkspaceAuto, i18n.T("init.flag_provider"))
+	templateName := fs.String("template", "", i18n.T("init.flag_template"))
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -25,34 +27,74 @@ func cmdInit(args []string) error {
 	if err != nil {
 		return err
 	}
-
-	// Git is a hard requirement: agents writing code without version control
-	// have no undo.
-	repo, err := workspace.Detect(cwd)
+	prov, err := openWorkspaceForInit(cwd, *provider)
 	if err != nil {
-		if errors.Is(err, workspace.ErrNoGit) {
-			return errors.New(i18n.T("init.no_git"))
-		}
-		return fmt.Errorf("%w", err)
+		return err
 	}
-	root := repo.Root()
+	root := prov.Root()
 	cfgPath := filepath.Join(root, config.FileName)
-
 	if config.Exists(cfgPath) && !*force {
 		return fmt.Errorf(i18n.T("init.exists"), config.FileName)
 	}
 
-	detected := config.Detect(root)
 	projectName := filepath.Base(root)
+	detected, seeded, err := seedOrDetect(root, projectName, *templateName, *force)
+	if err != nil {
+		return err
+	}
 	if err := os.WriteFile(cfgPath, []byte(config.DefaultYAML(detected, projectName)), 0o644); err != nil {
 		return err
 	}
-
+	// Always ignore the runtime dir, even with no .git yet: it holds prompts,
+	// results, and the filesystem provider's full baseline copy of the tree. A
+	// later `git init` would otherwise risk committing all of it. Writing a
+	// .gitignore does not force Git on anyone.
 	gitignoreAdded, err := ensureGitignore(root)
 	if err != nil {
 		return err
 	}
+	printInitSummary(root, detected, seeded, gitignoreAdded)
+	return nil
+}
 
+// openWorkspaceForInit resolves the workspace provider, translating the git-only
+// failures into actionable messages. Git is recommended but not required: auto
+// and filesystem run in any folder, so an agent's work is still snapshotted and
+// reversible without a VCS. Only --provider git hard-requires a repo.
+func openWorkspaceForInit(cwd, provider string) (workspace.Provider, error) {
+	prov, err := workspace.Open(cwd, provider)
+	if err != nil {
+		switch {
+		case errors.Is(err, workspace.ErrNoGit):
+			return nil, errors.New(i18n.T("init.no_git"))
+		case errors.Is(err, workspace.ErrNotRepo):
+			return nil, errors.New(i18n.T("init.not_repo"))
+		}
+		return nil, fmt.Errorf("%w", err)
+	}
+	return prov, nil
+}
+
+// seedOrDetect returns the stack config for the new vichu.yaml: with --template
+// it seeds a ready-to-run project and uses that template's config; otherwise it
+// detects the existing stack in place. The returned slice is the seeded files.
+func seedOrDetect(root, projectName, templateName string, force bool) (config.Detected, []string, error) {
+	if templateName == "" {
+		return config.Detect(root), nil, nil
+	}
+	tpl, err := resolveTemplate(templateName)
+	if err != nil {
+		return config.Detected{}, nil, err
+	}
+	seeded, err := writeTemplate(root, tpl, projectName, force)
+	if err != nil {
+		return config.Detected{}, nil, err
+	}
+	return tpl.Detected, seeded, nil
+}
+
+// printInitSummary reports what `vichu init` wrote.
+func printInitSummary(root string, detected config.Detected, seeded []string, gitignoreAdded bool) {
 	row := func(label, value string) { fmt.Printf("  %-10s %s\n", label, value) }
 	fmt.Printf(i18n.T("init.done")+"\n\n", root)
 	row(i18n.T("init.language")+":", orUnknown(detected.Language))
@@ -64,11 +106,13 @@ func cmdInit(args []string) error {
 	}
 	fmt.Println()
 	row(i18n.T("init.wrote"), config.FileName)
+	for _, f := range seeded {
+		row(i18n.T("init.wrote"), f)
+	}
 	if gitignoreAdded {
 		fmt.Printf("  "+i18n.T("init.updated_gi")+"\n", runtime.DirName)
 	}
 	fmt.Println("\n" + i18n.T("init.next"))
-	return nil
 }
 
 // ensureGitignore makes sure the runtime directory is ignored. Runs may contain

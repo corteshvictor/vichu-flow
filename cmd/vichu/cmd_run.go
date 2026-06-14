@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/corteshvictor/vichu-flow/internal/config"
@@ -15,7 +16,12 @@ import (
 func cmdRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	workflow := fs.String("workflow", "", i18n.T("run.flag_workflow"))
-	provider := fs.String("provider", "", i18n.T("run.flag_provider"))
+	// Note: this is the workflow provider label, not the workspace provider — the
+	// latter is project-level config (workspace.provider / `vichu init --provider`).
+	workflowProvider := fs.String("workflow-provider", "", i18n.T("run.flag_workflow_provider"))
+	// Deprecated alias kept so v0.2 automation that passed --provider doesn't break
+	// with "flag provided but not defined". It still sets the workflow label.
+	deprecatedProvider := fs.String("provider", "", i18n.T("run.flag_provider_deprecated"))
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -31,8 +37,15 @@ func cmdRun(args []string) error {
 		}
 		return err
 	}
-	if *provider != "" {
-		proj.cfg.Workflow.Provider = *provider
+	wfProvider := *workflowProvider
+	if *deprecatedProvider != "" {
+		fmt.Fprintln(os.Stderr, i18n.T("run.provider_renamed"))
+		if wfProvider == "" {
+			wfProvider = *deprecatedProvider
+		}
+	}
+	if wfProvider != "" {
+		proj.cfg.Workflow.Provider = wfProvider
 	}
 
 	fmt.Printf(i18n.T("run.running")+"\n", workflowName(proj, *workflow), task)

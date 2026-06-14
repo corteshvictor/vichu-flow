@@ -92,10 +92,15 @@ func toSlash(p string) string {
 	return strings.ReplaceAll(p, "\\", "/")
 }
 
-// isRuntimePath reports whether a path is inside VichuFlow's own .vichu runtime
+// runtimeDirName is VichuFlow's per-project runtime directory, which holds run
+// state, locks, and the filesystem provider's baseline. It is never a worker
+// mutation and is always excluded from change detection.
+const runtimeDirName = ".vichu"
+
+// isRuntimePath reports whether a path is inside VichuFlow's own runtime
 // directory, which must never be treated as a worker mutation or as drift,
 // independent of whether the project gitignores it.
 func isRuntimePath(p string) bool {
 	p = toSlash(p)
-	return p == ".vichu" || strings.HasPrefix(p, ".vichu/")
+	return p == runtimeDirName || strings.HasPrefix(p, runtimeDirName+"/")
 }
