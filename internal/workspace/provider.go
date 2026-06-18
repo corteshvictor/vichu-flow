@@ -23,6 +23,10 @@ type Provider interface {
 	// BeginTracking snapshots the changed set before a worker runs; Tracker.Finish
 	// diffs it after to report the worker's exact mutations.
 	BeginTracking() (*Tracker, error)
+	// ResumeTracking reconstructs a Tracker from a before-snapshot produced by
+	// Tracker.Before, so a host-first `worker complete` can diff against what a
+	// separate `worker start` process captured.
+	ResumeTracking(before map[string]core.FileSig) *Tracker
 	// BackupChanged captures the content of every currently-changed file, so a
 	// blocking gate's damage to pre-existing work can be rolled back.
 	BackupChanged() (*Backup, error)

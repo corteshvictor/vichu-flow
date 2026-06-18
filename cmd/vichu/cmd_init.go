@@ -19,6 +19,8 @@ func cmdInit(args []string) error {
 	force := fs.Bool("force", false, i18n.T("init.flag_force"))
 	provider := fs.String("provider", config.WorkspaceAuto, i18n.T("init.flag_provider"))
 	templateName := fs.String("template", "", i18n.T("init.flag_template"))
+	host := fs.String("host", "", i18n.T("init.flag_host"))
+	dryRun := fs.Bool("dry-run", false, i18n.T("init.flag_dry_run"))
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -33,6 +35,12 @@ func cmdInit(args []string) error {
 	}
 	root := prov.Root()
 	cfgPath := filepath.Join(root, config.FileName)
+
+	// --host on an already-initialized project, or a fresh --host --dry-run, only
+	// touches the pack (never the config) — handled and returned by the helper.
+	if done, err := maybeHostOnly(root, cfgPath, *host, *force, *dryRun); done {
+		return err
+	}
 	if config.Exists(cfgPath) && !*force {
 		return fmt.Errorf(i18n.T("init.exists"), config.FileName)
 	}
@@ -54,7 +62,33 @@ func cmdInit(args []string) error {
 		return err
 	}
 	printInitSummary(root, detected, seeded, gitignoreAdded)
+	if *host != "" {
+		fmt.Println()
+		return installHostAndReport(root, *host, *force, *dryRun)
+	}
 	return nil
+}
+
+// maybeHostOnly handles the two `--host` paths that do NOT run a full init:
+// adding the pack to an already-initialized project (keep vichu.yaml, ensure
+// .vichu/ gitignored), and a fresh `--host --dry-run` (preview only, write
+// nothing). It returns done=true when it handled the command.
+func maybeHostOnly(root, cfgPath, host string, force, dryRun bool) (done bool, err error) {
+	if host == "" {
+		return false, nil
+	}
+	if config.Exists(cfgPath) {
+		if !dryRun {
+			if _, gerr := ensureGitignore(root); gerr != nil {
+				return true, gerr
+			}
+		}
+		return true, installHostAndReport(root, host, force, dryRun)
+	}
+	if dryRun {
+		return true, installHostAndReport(root, host, force, true)
+	}
+	return false, nil // fresh install: fall through to normal init + pack at the end
 }
 
 // openWorkspaceForInit resolves the workspace provider, translating the git-only

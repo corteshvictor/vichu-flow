@@ -49,6 +49,27 @@ func newTracker(src changeSource) (*Tracker, error) {
 	return &Tracker{src: src, before: before}, nil
 }
 
+// Before returns the tracker's pre-worker snapshot in serializable form, so the
+// host-first `worker start` can persist it for `worker complete` to reload.
+func (t *Tracker) Before() map[string]core.FileSig {
+	out := make(map[string]core.FileSig, len(t.before))
+	for p, f := range t.before {
+		out[p] = core.FileSig{Code: f.code, Hash: f.hash}
+	}
+	return out
+}
+
+// resumeTracker reconstructs a Tracker from a persisted before-snapshot, so
+// `worker complete` diffs against exactly what `worker start` captured — even in
+// a separate process.
+func resumeTracker(src changeSource, before map[string]core.FileSig) *Tracker {
+	b := make(map[string]changedFile, len(before))
+	for p, s := range before {
+		b[p] = changedFile{code: s.Code, hash: s.Hash}
+	}
+	return &Tracker{src: src, before: b}
+}
+
 // Finish diffs the working tree against the start snapshot and returns the
 // mutations the worker produced.
 func (t *Tracker) Finish() ([]core.Mutation, error) {

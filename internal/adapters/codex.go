@@ -247,11 +247,12 @@ func buildCodexResult(oc codexOutcome, werr error, stderr *bytes.Buffer) (core.R
 		exitMsg = oc.errMsg
 	}
 	result := core.Result{
-		Markdown:    oc.lastMessage,
-		TokensIn:    oc.tokensIn,
-		TokensOut:   oc.tokensOut,
-		SessionID:   oc.threadID,
-		ExitMessage: exitMsg,
+		Markdown:       oc.lastMessage,
+		TokensIn:       oc.tokensIn,
+		TokensOut:      oc.tokensOut,
+		TokensReported: true, // codex reports token usage but not USD cost
+		SessionID:      oc.threadID,
+		ExitMessage:    exitMsg,
 	}
 	if oc.errMsg != "" {
 		return result, fmt.Errorf("codex reported an error: %s", tail(oc.errMsg, 2000))

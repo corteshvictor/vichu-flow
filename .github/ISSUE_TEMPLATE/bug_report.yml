@@ -16,7 +16,7 @@ body:
       description: Exact commands. Include the relevant `vichu.yaml` if it matters.
       placeholder: |
         1. vichu init
-        2. vichu run "..."
+        2. vichu exec "..."   # headless; or describe the host-pack run
         3. ...
     validations:
       required: true

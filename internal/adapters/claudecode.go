@@ -248,12 +248,14 @@ func buildResult(final *claudeResult, sessionID string, werr error, stderr *byte
 		return core.Result{}, fmt.Errorf("claude exited without a result event: %s", tail(msg, 2000))
 	}
 	result := core.Result{
-		Markdown:    final.Result,
-		CostUSD:     final.TotalCostUSD,
-		TokensIn:    final.Usage.InputTokens,
-		TokensOut:   final.Usage.OutputTokens,
-		SessionID:   firstNonEmpty(final.SessionID, sessionID),
-		ExitMessage: final.Subtype,
+		Markdown:       final.Result,
+		CostUSD:        final.TotalCostUSD,
+		CostReported:   true, // claude-code reports total_cost_usd
+		TokensIn:       final.Usage.InputTokens,
+		TokensOut:      final.Usage.OutputTokens,
+		TokensReported: true,
+		SessionID:      firstNonEmpty(final.SessionID, sessionID),
+		ExitMessage:    final.Subtype,
 	}
 	if final.IsError {
 		return result, fmt.Errorf("claude reported an error result (%s): %s", final.Subtype, tail(final.Result, 2000))

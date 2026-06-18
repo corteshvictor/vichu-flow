@@ -31,6 +31,15 @@ type Workspace struct {
 	CapturedAt   time.Time         `json:"captured_at"`
 }
 
+// FileSig is a tracked path's porcelain status code + content hash — the
+// serializable form of a worker's "before" snapshot. The host-first
+// `worker start` persists it and `worker complete` (a SEPARATE process) reloads
+// it, so mutation attribution survives across the two commands.
+type FileSig struct {
+	Code string `json:"code"`
+	Hash string `json:"hash"`
+}
+
 // MutationKind classifies a file change relative to the previous snapshot.
 type MutationKind string
 

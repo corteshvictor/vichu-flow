@@ -36,10 +36,14 @@ type FakeVerdict struct {
 // optional result text. It can be provided programmatically (tests) or loaded
 // from the JSON file named by VICHU_FAKE_SCRIPT (CLI end-to-end runs).
 type FakeScript struct {
-	ResultText string  `json:"result_text,omitempty"`
-	CostUSD    float64 `json:"cost_usd,omitempty"`  // simulated per-invocation cost
-	TokensIn   int     `json:"tokens_in,omitempty"` // simulated per-invocation usage
-	TokensOut  int     `json:"tokens_out,omitempty"`
+	ResultText string `json:"result_text,omitempty"`
+	// ResultTextByRole overrides ResultText for a specific role (e.g. an empty
+	// proposer result to exercise the required-artifact contract). A present key
+	// wins even when its value is empty.
+	ResultTextByRole map[string]string `json:"result_text_by_role,omitempty"`
+	CostUSD          float64           `json:"cost_usd,omitempty"`  // simulated per-invocation cost
+	TokensIn         int               `json:"tokens_in,omitempty"` // simulated per-invocation usage
+	TokensOut        int               `json:"tokens_out,omitempty"`
 	// ResultErr, when set, makes Result return this error while still reporting
 	// the scripted cost/tokens — for testing the failed-worker accounting path.
 	ResultErr string                  `json:"result_err,omitempty"`
@@ -118,13 +122,15 @@ func (f *Fake) run(_ context.Context, inv Invocation) (Session, error) {
 	events := make(chan AgentEvent, 16)
 	go f.streamActions(events, inv)
 	result := core.Result{
-		Markdown:    f.resultText(inv.Role),
-		Data:        f.resultData(inv.Role, inv.Iteration),
-		CostUSD:     f.script.CostUSD,
-		TokensIn:    f.script.TokensIn,
-		TokensOut:   f.script.TokensOut,
-		SessionID:   "fake-session-" + inv.Role,
-		ExitMessage: "ok",
+		Markdown:       f.resultText(inv.Role),
+		Data:           f.resultData(inv.Role, inv.Iteration),
+		CostUSD:        f.script.CostUSD,
+		CostReported:   true, // the simulator reports deterministic usage
+		TokensIn:       f.script.TokensIn,
+		TokensOut:      f.script.TokensOut,
+		TokensReported: true,
+		SessionID:      "fake-session-" + inv.Role,
+		ExitMessage:    "ok",
 	}
 	sess := &bufferedSession{events: events, result: result}
 	if f.script.ResultErr != "" {
@@ -192,6 +198,9 @@ func (f *Fake) resultData(role string, iteration int) map[string]any {
 }
 
 func (f *Fake) resultText(role string) string {
+	if t, ok := f.script.ResultTextByRole[role]; ok {
+		return t // a present key wins, even when empty (e.g. an empty proposal)
+	}
 	if f.script.ResultText != "" {
 		return f.script.ResultText
 	}

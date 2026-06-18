@@ -94,6 +94,8 @@ func (s *Shell) Start(ctx context.Context, inv Invocation) (Session, error) {
 			exitMsg = werr.Error()
 		}
 
+		// A shell command has no token/cost usage, so CostReported/TokensReported stay
+		// false (not applicable) — the run reports those as unknown, never a fake $0.
 		result := core.Result{
 			Markdown:    captured.String(),
 			Data:        map[string]any{"exit_code": exitCode, "command": strings.Join(inv.Command, " ")},

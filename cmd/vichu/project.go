@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -59,15 +60,58 @@ func openProject() (*project, error) {
 	return &project{root: root, cfg: cfg, store: runtime.Open(root), repo: repo}, nil
 }
 
-// newEngine builds an engine for the project, printing stage progress.
+// newEngine builds an engine that prints stage progress to STDOUT (human mode).
 func (p *project) newEngine() *engine.Engine {
+	return p.newEngineWithLog(func(m string) { fmt.Println("  " + m) })
+}
+
+// engineForOutput returns an engine whose progress goes to STDERR when jsonOut is
+// set, so stdout stays PURE JSON for `--json` consumers (host packs / automation)
+// while a human still sees the progress. The engine logs run completion/block/fail,
+// which would otherwise contaminate the JSON object on stdout.
+func (p *project) engineForOutput(jsonOut bool) *engine.Engine {
+	if jsonOut {
+		return p.newEngineWithLog(func(m string) { fmt.Fprintln(os.Stderr, "  "+m) })
+	}
+	return p.newEngine()
+}
+
+func (p *project) newEngineWithLog(log func(string)) *engine.Engine {
 	return engine.New(engine.Options{
 		Store:    p.store,
 		Registry: adapters.DefaultRegistry(),
 		Config:   p.cfg,
 		Repo:     p.repo,
-		Log:      func(m string) { fmt.Println("  " + m) },
+		Log:      log,
 	})
+}
+
+// parseArgsAnyOrder parses fs allowing flags to appear BEFORE or AFTER positional
+// args. Go's flag package stops at the first positional, so `cmd <id> --json` would
+// silently drop `--json`; this re-parses the tail after each positional so both
+// `cmd --json <id>` and `cmd <id> --json` work. Returns the positionals in order.
+func parseArgsAnyOrder(fs *flag.FlagSet, args []string) ([]string, error) {
+	var positionals []string
+	for len(args) > 0 {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		rest := fs.Args()
+		if len(rest) == 0 {
+			break
+		}
+		positionals = append(positionals, rest[0])
+		args = rest[1:]
+	}
+	return positionals, nil
+}
+
+// firstArg returns the first positional or "" — the optional run id most commands take.
+func firstArg(positionals []string) string {
+	if len(positionals) == 0 {
+		return ""
+	}
+	return positionals[0]
 }
 
 // resolveRunID returns the given id, or the latest run if id is empty.

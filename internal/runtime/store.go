@@ -182,6 +182,113 @@ func (s *Store) SaveMutationReport(runID, workerID string, r *core.MutationRepor
 	return writeJSON(filepath.Join(s.WorkerDir(runID, workerID), "mutations.json"), r)
 }
 
+// ConfigSnapshotExists reports whether the run's frozen config was persisted.
+func (s *Store) ConfigSnapshotExists(runID string) bool {
+	_, err := os.Stat(s.ConfigSnapshotPath(runID))
+	return err == nil
+}
+
+// SaveOperation records a host-first transactional command's result under
+// runs/<id>/operations/<op-id>.json, keyed by the caller's --op-id, so a retry
+// returns the same result instead of re-applying the operation (idempotency).
+func (s *Store) SaveOperation(runID, opID string, rec any) error {
+	return writeJSON(filepath.Join(s.RunDir(runID), "operations", opID+".json"), rec)
+}
+
+// SaveGlobalOperation records an operation that runs BEFORE a run exists (run
+// start), under .vichu/operations/<scope>/<op-id>.json, so a retry maps to the
+// same run instead of creating a duplicate.
+func (s *Store) SaveGlobalOperation(scope, opID string, rec any) error {
+	return writeJSON(filepath.Join(s.root, "operations", scope, opID+".json"), rec)
+}
+
+// LoadGlobalOperation reads a global operation record. found=false (nil error)
+// means this op-id has not run yet for the scope.
+func (s *Store) LoadGlobalOperation(scope, opID string, rec any) (found bool, err error) {
+	err = readJSON(filepath.Join(s.root, "operations", scope, opID+".json"), rec)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// ReserveGlobalOperation atomically claims an op-id for a scope: it writes the
+// record only if one does not already exist (O_EXCL). reserved=true means THIS
+// caller won the claim; reserved=false with existing populated means another
+// attempt already claimed it (read it back into existing). This is what makes
+// `run start --op-id` create exactly one run even across crashes/retries.
+func (s *Store) ReserveGlobalOperation(scope, opID string, rec any, existing any) (reserved bool, err error) {
+	dir := filepath.Join(s.root, "operations", scope)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return false, err
+	}
+	data, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		return false, err
+	}
+	path := filepath.Join(dir, opID+".json")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return false, readJSON(path, existing) // someone else claimed it — read it
+		}
+		return false, err
+	}
+	defer func() { _ = f.Close() }()
+	if _, werr := f.Write(append(data, '\n')); werr != nil {
+		return false, werr
+	}
+	return true, nil
+}
+
+// LoadOperation reads a previously recorded operation result. found=false (with a
+// nil error) means this op-id has not run yet.
+func (s *Store) LoadOperation(runID, opID string, rec any) (found bool, err error) {
+	err = readJSON(filepath.Join(s.RunDir(runID), "operations", opID+".json"), rec)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// SaveArtifact writes a named artifact's content to artifacts/<filename> within a
+// run. The caller resolves filename from the core allowlist (core.ArtifactFilename)
+// — this never takes a host-supplied path, preserving single-writer + no escape.
+func (s *Store) SaveArtifact(runID, filename string, content []byte) error {
+	return writeFileAtomic(filepath.Join(s.ArtifactsDir(runID), filename), content, 0o644)
+}
+
+// SaveArtifactMeta persists an artifact's provenance (which stage/iteration produced
+// it) to artifacts/<name>.json — distinct from the artifact's own <filename> — so
+// checkRequiredArtifact can verify a required artifact is THIS stage entry's
+// evidence, not a stale file from another stage or iteration.
+func (s *Store) SaveArtifactMeta(runID, name string, meta core.ArtifactMeta) error {
+	return writeJSON(filepath.Join(s.ArtifactsDir(runID), name+".json"), meta)
+}
+
+// LoadArtifactMeta reloads the provenance saved by SaveArtifactMeta.
+func (s *Store) LoadArtifactMeta(runID, name string) (core.ArtifactMeta, error) {
+	var meta core.ArtifactMeta
+	err := readJSON(filepath.Join(s.ArtifactsDir(runID), name+".json"), &meta)
+	return meta, err
+}
+
+// SaveWorkerTracking persists a worker's "before" snapshot to
+// workers/<id>/tracking.json, so a host-first `worker complete` (a separate
+// process) can reload exactly what `worker start` captured.
+func (s *Store) SaveWorkerTracking(runID, workerID string, before map[string]core.FileSig) error {
+	return writeJSON(filepath.Join(s.WorkerDir(runID, workerID), "tracking.json"), before)
+}
+
+// LoadWorkerTracking reloads the "before" snapshot saved by SaveWorkerTracking.
+func (s *Store) LoadWorkerTracking(runID, workerID string) (map[string]core.FileSig, error) {
+	var before map[string]core.FileSig
+	if err := readJSON(filepath.Join(s.WorkerDir(runID, workerID), "tracking.json"), &before); err != nil {
+		return nil, err
+	}
+	return before, nil
+}
+
 // SaveReviewVerdict persists reviews/<stage>/iteration-<n>/verdict.json — the
 // validated review outcome, the runtime's public contract for a review stage.
 func (s *Store) SaveReviewVerdict(runID, stage string, iteration int, v *core.Verdict) error {

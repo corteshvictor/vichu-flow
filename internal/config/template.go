@@ -39,7 +39,7 @@ ui:
   timezone: local
 
 workflow:
-  default: quick           # quick | review
+  default: quick           # quick | review | sdd
   provider: ""             # workflow provider label; empty for quick
   maxAutoIterations: 5     # max review iterations for the review auto-fix loop
   reviewContext: diff-only # diff-only | full — reviewer sees just the diff (cheaper) or explores
@@ -51,9 +51,9 @@ workspace:
   requireCleanTree: warn        # warn | block | allow
 
 observability:
-  tui: true
-  web: false            # web dashboard ships in v0.5
-  webPort: 3737
+  tui: false            # RESERVED — today 'vichu observe' is text/read-only; rich TUI planned for v0.6
+  web: false            # RESERVED — rich web dashboard planned for v0.6
+  webPort: 3737         # RESERVED — used once the web dashboard ships
 
 # Which adapter runs each worker role. "fake" runs deterministically with no
 # agent CLI, so a fresh project works out of the box. Switch to claude-code or

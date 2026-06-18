@@ -1,0 +1,15 @@
+{
+  "host": "claude-code",
+  "mode": "native",
+  "description": "VichuFlow orchestrator for Claude Code: talk to your agent, it drives a verified run.",
+  "capabilities": { "skills": true, "subagents": true, "slashCommands": true },
+  "requires": [{ "bin": "claude", "reason": "the Claude Code CLI runs this pack" }],
+  "verify": { "adapter": "claude-code" },
+  "files": [
+    { "src": "skills/vichu-orchestrator/SKILL.md", "dest": ".claude/skills/vichu-orchestrator/SKILL.md" },
+    { "src": "agents/vichu-worker.md", "dest": ".claude/agents/vichu-worker.md" },
+    { "src": "agents/vichu-implementer.md", "dest": ".claude/agents/vichu-implementer.md" },
+    { "src": "agents/vichu-reviewer.md", "dest": ".claude/agents/vichu-reviewer.md" },
+    { "src": "commands/vichu.md", "dest": ".claude/commands/vichu.md" }
+  ]
+}

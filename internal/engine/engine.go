@@ -33,7 +33,16 @@ type Engine struct {
 	gates    *gates.Runner
 	policy   security.Policy
 	log      func(string)
+	// strict, when set (during a host-first transactional command), makes
+	// must-succeed persistence failures abort the command instead of warning —
+	// so a host never gets "success" while the runtime is left corrupt. nil for
+	// the full runner, which degrades loudly but keeps the loop going.
+	strict *strictScope
 }
+
+// strictScope collects the first must-succeed write failure within a host-first
+// operation. The engine is single-goroutine per command process, so no locking.
+type strictScope struct{ err error }
 
 // Options configures a new Engine.
 type Options struct {
@@ -89,10 +98,123 @@ func (rs *runState) wallClockSpent() float64 {
 
 // Start creates a new run and executes it until it completes or blocks.
 func (e *Engine) Start(ctx context.Context, task, workflowName string) (*core.State, error) {
-	if workflowName == "" {
-		workflowName = e.cfg.Workflow.Default
+	cr, err := e.createRun(task, workflowName, "")
+	if err != nil {
+		return nil, err
 	}
-	wf, err := workflows.Get(workflowName)
+	// A pre-stage block (requireCleanTree=block on a dirty tree) leaves the run
+	// blocked before a single stage ran — return it without acquiring the lock.
+	if cr.state.Status != core.StatusActive {
+		return cr.state, nil
+	}
+
+	handle, err := e.store.AcquireLock(cr.state.RunID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = handle.Release() }()
+
+	rs := &runState{wf: cr.wf, pack: cr.pack.Markdown, baseSHA: cr.snap.BaseSHA, startedAt: time.Now()}
+	return e.runWithHeartbeat(ctx, handle, cr.state, rs)
+}
+
+// StartRun materializes a new run and returns its persisted initial state WITHOUT
+// executing any stage — the host-first lifecycle entry point (`vichu run start`).
+// The host then drives the workers itself and calls the transactional commands to
+// audit and advance the run. If requireCleanTree=block on a dirty tree, the run is
+// returned already blocked.
+func (e *Engine) StartRun(task, workflowName, opID string) (*core.State, error) {
+	if opID == "" {
+		cr, err := e.createRun(task, workflowName, "")
+		if err != nil {
+			return nil, err
+		}
+		return cr.state, nil
+	}
+	if !validOpID(opID) {
+		return nil, fmt.Errorf("invalid --op-id %q (use letters, digits, '.', '_', '-')", opID)
+	}
+
+	// Idempotency: run start happens BEFORE a run exists. We RESERVE the op-id
+	// atomically (O_EXCL) with a pre-generated run id BEFORE creating the run, so a
+	// crash/retry maps to the same run instead of duplicating. Fingerprint uses the
+	// NORMALIZED workflow, so "" and the default name are the same operation.
+	const scope = "run-start"
+	fp := opFingerprint(e.normalizeWorkflow(workflowName), task)
+	reservedID := runtime.NewRunID(time.Now())
+	rec := opRecord{Kind: scope, Fingerprint: fp, RunID: reservedID}
+	var prev opRecord
+	reserved, err := e.store.ReserveGlobalOperation(scope, opID, rec, &prev)
+	if err != nil {
+		return nil, err
+	}
+	if !reserved {
+		if prev.Kind != scope || prev.Fingerprint != fp {
+			return nil, fmt.Errorf("--op-id %q was already used for a different run start — use a fresh op-id", opID)
+		}
+		// Already reserved for this exact operation. Return the run only if it was
+		// FULLY materialized (state + workspace + context pack + config); a prior
+		// attempt that wrote state.json but crashed before the rest is incomplete —
+		// re-create with the reserved id so resume/drift/context have all the pieces.
+		if st, ok := e.completeRun(prev.RunID); ok {
+			return st, nil
+		}
+		reservedID = prev.RunID
+	}
+	cr, err := e.createRun(task, workflowName, reservedID)
+	if err != nil {
+		return nil, err
+	}
+	return cr.state, nil
+}
+
+// completeRun returns a run's state only if it was fully materialized by
+// createRun — state.json AND the auditable inputs (workspace, context pack,
+// config snapshot). A run with state.json but missing pieces is incomplete (a
+// crashed run start) and must be re-created, not returned.
+func (e *Engine) completeRun(runID string) (*core.State, bool) {
+	st, err := e.store.LoadState(runID)
+	if err != nil {
+		return nil, false
+	}
+	if _, werr := e.store.LoadWorkspace(runID); werr != nil {
+		return nil, false
+	}
+	if e.store.ContextPack(runID) == "" {
+		return nil, false
+	}
+	if !e.store.ConfigSnapshotExists(runID) {
+		return nil, false
+	}
+	return st, true
+}
+
+// normalizeWorkflow resolves an empty workflow name to the configured default, so
+// "" and the default name are the SAME operation for run-start idempotency.
+func (e *Engine) normalizeWorkflow(name string) string {
+	if name == "" {
+		return e.cfg.Workflow.Default
+	}
+	return name
+}
+
+// createdRun is a run materialized on disk — snapshot, state, workspace, context
+// pack, config snapshot — but not yet executed and not locked.
+type createdRun struct {
+	state *core.State
+	wf    *workflows.Workflow
+	pack  *contextpack.Pack
+	snap  *core.Workspace
+}
+
+// createRun materializes a new run WITHOUT acquiring the lock or executing any
+// stage. With an empty runID it generates one; with a non-empty runID it uses it
+// (so `run start --op-id` can reserve the id atomically before creating the run).
+// It is the lifecycle primitive shared by Start (which then runs the loop) and the
+// host-first `run start` command (which stops here). If requireCleanTree=block on
+// a dirty tree, the returned run is already blocked.
+func (e *Engine) createRun(task, workflowName, runID string) (*createdRun, error) {
+	wf, err := workflows.Get(e.normalizeWorkflow(workflowName))
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +224,9 @@ func (e *Engine) Start(ctx context.Context, task, workflowName string) (*core.St
 		return nil, fmt.Errorf("capturing workspace snapshot: %w", err)
 	}
 
-	runID := runtime.NewRunID(time.Now())
+	if runID == "" {
+		runID = runtime.NewRunID(time.Now())
+	}
 	state := &core.State{
 		RunID:        runID,
 		Status:       core.StatusActive,
@@ -129,28 +253,29 @@ func (e *Engine) Start(ctx context.Context, task, workflowName string) (*core.St
 	if err := e.store.SaveContextPack(runID, []byte(pack.Markdown)); err != nil {
 		return nil, err
 	}
-	e.warn(e.snapshotConfig(runID), "save config snapshot")
-
-	// requireCleanTree policy.
-	if len(snap.DirtyFiles) > 0 {
-		switch e.cfg.Workspace.RequireCleanTree {
-		case "block":
-			e.block(state, fmt.Sprintf("working tree has %d uncommitted change(s); requireCleanTree=block", len(snap.DirtyFiles)))
-			return state, nil
-		case "warn":
-			e.emit(state, "", "", "dirty_tree_warning", map[string]any{"dirty_files": len(snap.DirtyFiles)})
-			e.log(i18n.T("engine.dirty_warning", len(snap.DirtyFiles)))
-		}
+	// The config snapshot is part of the auditable run inputs — a run is not
+	// complete without it, so a failure here fails run creation (not a warn).
+	if err := e.snapshotConfig(runID); err != nil {
+		return nil, fmt.Errorf("saving config snapshot: %w", err)
 	}
 
-	handle, err := e.store.AcquireLock(runID)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = handle.Release() }()
+	e.applyCleanTreePolicy(state, snap)
+	return &createdRun{state: state, wf: wf, pack: pack, snap: snap}, nil
+}
 
-	rs := &runState{wf: wf, pack: pack.Markdown, baseSHA: snap.BaseSHA, startedAt: time.Now()}
-	return e.runWithHeartbeat(ctx, handle, state, rs)
+// applyCleanTreePolicy enforces requireCleanTree against the snapshot's dirty
+// set: block the run, warn, or allow silently.
+func (e *Engine) applyCleanTreePolicy(state *core.State, snap *core.Workspace) {
+	if len(snap.DirtyFiles) == 0 {
+		return
+	}
+	switch e.cfg.Workspace.RequireCleanTree {
+	case "block":
+		e.block(state, fmt.Sprintf("working tree has %d uncommitted change(s); requireCleanTree=block", len(snap.DirtyFiles)))
+	case "warn":
+		e.emit(state, "", "", "dirty_tree_warning", map[string]any{"dirty_files": len(snap.DirtyFiles)})
+		e.log(i18n.T("engine.dirty_warning", len(snap.DirtyFiles)))
+	}
 }
 
 // runWithHeartbeat runs the stage loop while keeping the lock heartbeat fresh. If
@@ -234,6 +359,52 @@ func (e *Engine) Resume(ctx context.Context, runID string, opts ResumeOptions) (
 		resumeSession: resumeSession,
 	}
 	return e.runWithHeartbeat(ctx, handle, state, rs)
+}
+
+// ReopenRun is the HOST-FIRST resume: it validates a run can be continued —
+// re-opens the original workspace provider and checks for drift — and returns its
+// state WITHOUT executing any stage or agent. The host then keeps driving via the
+// transactional commands. (The headless loop-running resume is Engine.Resume,
+// used by the deprecated `vichu resume` / CI fallback.)
+func (e *Engine) ReopenRun(runID string, opts ResumeOptions) (*core.State, error) {
+	state, err := e.store.LoadState(runID)
+	if err != nil {
+		return nil, err
+	}
+	if state.Status.Terminal() {
+		return state, nil
+	}
+	handle, err := e.acquireForResume(runID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = handle.Release() }()
+
+	snap, err := e.store.LoadWorkspace(runID)
+	if err != nil {
+		return nil, fmt.Errorf("loading workspace snapshot: %w", err)
+	}
+	if err := e.reopenProviderForResume(snap); err != nil {
+		return nil, err
+	}
+	_, blocked, err := e.resolveDrift(state, runID, snap, opts)
+	if err != nil {
+		return nil, err
+	}
+	if blocked {
+		return state, nil
+	}
+	// Mark active and reconcile interrupted workers, but DO NOT run the loop — the
+	// host owns execution.
+	if state.Status == core.StatusBlocked {
+		state.Status = core.StatusActive
+		state.BlockedReason = ""
+	}
+	ensureMaps(state)
+	e.reconcileInterruptedWorkers(state)
+	e.saveState(state)
+	e.emit(state, state.CurrentStage, "", core.EventRunResumed, map[string]any{"host": true})
+	return state, nil
 }
 
 // acquireForResume takes the run lock, translating a live-owner conflict into an
@@ -348,6 +519,14 @@ func (e *Engine) step(ctx context.Context, state *core.State, rs *runState) bool
 	}
 	if !e.executeStage(ctx, state, rs, stage) {
 		return false // the stage reached a terminal state
+	}
+	// Enforce a stage's required-artifact contract before advancing — the same gate
+	// host-first runs in `stage close`, so `vichu exec` and a host pack hold SDD to
+	// the identical bar (e.g. the `plan` stage must produce a `plan` artifact with a
+	// `## Tests` section). No-ops for stages without a RequiresArtifact.
+	if reason := e.checkRequiredArtifact(state, stage); reason != "" {
+		e.block(state, reason)
+		return false
 	}
 	return e.advanceStage(state, stage) // false ⇒ could not decide from evidence
 }
@@ -525,7 +704,7 @@ func (e *Engine) saveState(state *core.State) {
 		*state = *disk
 		return
 	}
-	e.warn(e.store.SaveState(state), "persist run state")
+	e.criticalWrite(e.store.SaveState(state), "persist run state")
 }
 
 // warn surfaces a non-fatal persistence/evidence failure through the log so it
@@ -536,6 +715,24 @@ func (e *Engine) warn(err error, what string) {
 	if err != nil {
 		e.log(fmt.Sprintf("warning: could not %s: %v", what, err))
 	}
+}
+
+// criticalWrite routes a must-succeed persistence error. In a host-first strict
+// scope it records the FIRST failure so the transactional command returns an
+// error (and the operation is NOT marked completed) — a reported success never
+// leaves the runtime missing state/status/mutations. Outside a strict scope (the
+// full runner) it degrades to a warn, as before.
+func (e *Engine) criticalWrite(err error, what string) {
+	if err == nil {
+		return
+	}
+	if e.strict != nil {
+		if e.strict.err == nil {
+			e.strict.err = fmt.Errorf("%s: %w", what, err)
+		}
+		return
+	}
+	e.warn(err, what)
 }
 
 // canceledOnDisk reports whether another process marked the run canceled.
@@ -553,7 +750,7 @@ func (e *Engine) finalizeIfCanceled(state *core.State) bool {
 	state.Status = core.StatusCanceled
 	state.ActiveWorker = ""
 	state.NextAction = ""
-	e.warn(e.store.SaveState(state), "persist canceled state")
+	e.criticalWrite(e.store.SaveState(state), "persist canceled state")
 	e.log(i18n.T("engine.canceled"))
 	return true
 }
@@ -592,7 +789,7 @@ func (e *Engine) complete(state *core.State) {
 	if state.Stages != nil {
 		state.Stages["done"] = core.StageDone
 	}
-	e.warn(e.store.SaveState(state), "persist completed state")
+	e.criticalWrite(e.store.SaveState(state), "persist completed state")
 	e.emit(state, "", "", core.EventRunCompleted, nil)
 	e.log(i18n.T("engine.completed"))
 }
@@ -608,7 +805,7 @@ func (e *Engine) block(state *core.State, reason string) {
 	// worker that already finished, failed, or was canceled.
 	state.ActiveWorker = ""
 	state.NextAction = "resolve and `vichu resume " + state.RunID + "`"
-	e.warn(e.store.SaveState(state), "persist blocked state")
+	e.criticalWrite(e.store.SaveState(state), "persist blocked state")
 	e.emit(state, state.CurrentStage, "", core.EventRunBlocked, map[string]any{"reason": reason})
 	e.log(i18n.T("engine.blocked", reason))
 }
@@ -621,7 +818,7 @@ func (e *Engine) fail(state *core.State, reason string) {
 	state.BlockedReason = reason
 	state.ActiveWorker = ""
 	state.NextAction = ""
-	e.warn(e.store.SaveState(state), "persist failed state")
+	e.criticalWrite(e.store.SaveState(state), "persist failed state")
 	e.emit(state, state.CurrentStage, "", core.EventRunFailed, map[string]any{"reason": reason})
 	e.log(i18n.T("engine.failed", reason))
 }

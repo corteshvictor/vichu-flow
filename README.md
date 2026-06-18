@@ -1,6 +1,6 @@
 # VichuFlow
 
-> Observable, verifiable agentic workflow orchestration for real software tasks.
+> An installable, verifiable agentic workflow for your coding assistant.
 
 [![CI](https://github.com/corteshvictor/vichu-flow/actions/workflows/ci.yml/badge.svg)](https://github.com/corteshvictor/vichu-flow/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/corteshvictor/vichu-flow.svg)](https://pkg.go.dev/github.com/corteshvictor/vichu-flow)
@@ -8,11 +8,13 @@
 [![Release](https://img.shields.io/github/v/release/corteshvictor/vichu-flow?sort=semver)](https://github.com/corteshvictor/vichu-flow/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-VichuFlow is an open-source, cross-platform runtime that runs **workflows as
-persistent state machines** over any repository. It coordinates existing coding
-agents from the outside, and **decides stage transitions from evidence it
-verifies itself** — running your tests, lint, and typecheck — never from the
-agent's own say-so.
+VichuFlow installs into the coding agent you already use (Claude Code today) and
+turns a natural-language request into a **verified run** — a persistent state
+machine over your repository. You talk to your agent; VichuFlow orchestrates,
+delegating the coding to native subagents and **deciding every stage transition
+from evidence it verifies itself** — running your tests, lint, and typecheck —
+never from the agent's own say-so. The `vichu` binary is the kernel/verifier; you
+drive it from inside your agent (or headless with `vichu exec` for CI).
 
 > **Adapter status:** VichuFlow ships the `claude-code`, `codex`, `shell`, and
 > `fake` adapters. More agents (OpenCode, Gemini CLI) are planned through the
@@ -26,17 +28,29 @@ editor (no external record, no resume after a crash) or fan out parallel agents
 with a diff UI (no workflow, no verified gates). VichuFlow is the missing piece:
 an **external runtime that doesn't trust the agent**.
 
-- **It can't lie to you.** A stage only advances when VichuFlow runs your tests
-  itself and sees them pass. An agent that claims success without a green gate
-  is blocked, with the evidence on disk.
+- **It can't lie to you.** A run only **completes** when VichuFlow runs your tests
+  itself and the verify gate passes; intermediate stages advance only on
+  kernel-validated evidence — a mutation audit, an artifact's provenance, a
+  structured review verdict — never the agent's say-so. An agent that claims success
+  without that evidence is blocked, with the proof on disk.
 - **It survives crashes.** A run is plain files (`state.json` + `events.ndjson`).
-  Kill it, reboot, `vichu resume` — it picks up where it stopped.
+  Kill it, reboot, and resume from where it stopped: `vichu run resume <id>`
+  reopens and re-validates the run so your host keeps driving it, or `vichu exec
+  resume <id>` continues it headless.
 - **It won't wreck your work.** Workspace snapshots (Git or filesystem),
-  per-worker mutation tracking, a command policy that blocks `rm -rf`/`git
-  push`/installs before they run, and automatic rollback if a check touches your
-  files.
-- **It won't burn your budget.** Hard limits on wall-clock, cost, and tokens
-  (summed across every agent) stop runaway loops and surprise bills.
+  per-worker mutation tracking, and automatic rollback if a check touches your
+  files. When VichuFlow runs commands itself (gates, `shell` workers, the headless
+  `claude-code`/`codex` adapters), a command policy blocks `rm -rf`/`git
+  push`/installs **before** they run. In host-first native mode the host (Claude
+  Code) runs its own subagents, so preventive control belongs to the host; the
+  kernel's guarantee is that it **audits every mutation and blocks the run from
+  advancing** on a violation — disallowed changes can't move the run forward.
+- **It won't burn your budget.** Hard limits on agent invocations and wall-clock
+  always apply; cost and token caps apply per dimension whenever the agent reports
+  it — `claude-code` reports both, `codex` reports tokens but not USD cost, `shell`
+  reports neither, and a native host reports whatever it exposes. Together they
+  stop runaway loops and surprise bills (see the usage matrix in
+  [configuration.md](docs/user/configuration.md#budgets)).
 - **It's vendor-neutral.** Implement with one agent, review with another — or
   none, using plain shell commands.
 
@@ -45,8 +59,9 @@ VichuFlow coordinates agents; it does not replace them or write code itself.
 Three ideas hold it together:
 
 1. **External, observable runtime.** Every run is flat files on disk
-   (`state.json` + `events.ndjson`); the CLI, TUI, and web are just views. A run
-   survives a crash, resumes, and is fully auditable.
+   (`state.json` + `events.ndjson`); the CLI is a view today, with a TUI and web
+   dashboard planned on the same data. A run survives a crash, resumes, and is
+   fully auditable.
 2. **Verified evidence.** VichuFlow runs your test/lint/typecheck commands
    itself, captures exit code and output, and only that verdict authorizes a
    transition. An agent that claims success without passing the gate does not
@@ -60,10 +75,12 @@ The latest release is shown by the **Release badge** above; the version is
 tracked by git tags and `CHANGELOG.md`, not hardcoded here. The current build
 ships:
 
-- `vichu init [--template]`, `new`, `doctor`, `run`, `status [--watch]`, `resume`, `cancel`, `adapters`, `config`
+- **Host packs** (`vichu init --host claude-code`): install the orchestrator skill + native subagents into your coding agent, then drive verified runs by talking to it. The kernel owns state and gates; the host runs the agents.
+- **Host-first kernel commands** the pack drives: `run start` · `worker start`/`complete` · `review complete` · `stage close` · `run resume` · `status --json` · `observe` — transactional, idempotent (`--op-id`), single-writer.
+- `vichu init [--template]`, `new`, `doctor`, `exec` (headless fallback), `status [--watch]`, `cancel`, `adapters`, `config`
 - **Project templates** (`vichu new <name> --template go|node|python|rust|empty`, or `vichu init --template`): scaffold a runnable project with a real gate, so the first run completes from scratch — Git optional
 - Persistent runtime: atomic `state.json`, append-only `events.ndjson`, heartbeat locks with orphan reclaim, cooperative cancel
-- `quick` workflow (explore → implement → verify) and **`review`** workflow (an adversarial review → auto-fix loop that branches on a structured, persisted verdict)
+- Workflows: **`sdd`** (explore → propose → plan → implement → review → (approved: verify, needs_fixes: fix → review), with allowlisted `proposal`/`plan` artifacts and TDD-intent enforcement), **`review`** (adversarial review → auto-fix loop), and **`quick`**
 - Adapters: **`claude-code`** and **`codex`** (headless, streamed events, session resume), `shell`, and `fake` (deterministic, for CI)
 - **Workspace providers** — `git` or `filesystem` (`workspace.provider: auto`), so runs work with or without a VCS (see below)
 - Verified gates, workspace snapshots with content fingerprints, per-worker mutation tracking, and enforced mutation policy (sensitive files block, read-only stages enforced)
@@ -107,46 +124,48 @@ go install github.com/corteshvictor/vichu-flow/cmd/vichu@latest   # Go 1.26+
 
 ## Quick start
 
-**New project** — scaffold runnable source plus a real gate, then run:
+**Install the host pack and talk to your agent.** VichuFlow installs into the
+coding agent you already use (Claude Code today); you describe the task in natural
+language and it orchestrates a verified run — the kernel owns the state, runs the
+gates, and decides every transition.
 
 ```bash
-vichu new my-app --template go     # or: empty | node | python | rust
-cd my-app
-vichu run "add a sum function"     # → completed (gate: go test ./...)
-vichu status                       # inspect the latest run
+cd your-project                       # a Git repo, or any folder — Git is optional
+vichu init --host claude-code         # install the orchestrator skill + subagents
+# then, inside Claude Code:
+#   "implement password reset using sdd"
+#   "fix the failing login test"
+#   "continue the run"
 ```
 
-**Existing project** — initialize in place:
+The orchestrator drives the run through the kernel's transactional commands —
+delegating the coding to native subagents and letting the kernel verify every
+stage against your real tests/lint/typecheck. The workflow `sdd`
+(explore → propose → plan → implement → review → (approved: verify, needs_fixes:
+fix → review)) is spec-driven; `quick` (explore → implement → verify) is for small
+changes; `review` adds an adversarial review → auto-fix loop on top of `quick`.
+Observe any run with `vichu status <id>` or `vichu observe <id>`.
+
+**Starting from nothing?** Scaffold a runnable project (source + a real gate) so
+the first run completes with no manual config:
 
 ```bash
-cd your-project                    # a Git repo, or any folder — Git is optional
-vichu init                         # detect stack, write vichu.yaml, ignore .vichu/
-vichu run "add a hello function"   # (or `vichu init --template node` to seed one)
+vichu new my-app --template go        # or: empty | node | python | rust
+cd my-app && vichu init --host claude-code
 ```
 
-Each template seeds minimal source plus a real gate using the stack's built-in
-test runner (no package install), so the **very first run completes** — with or
-without Git. By default a fresh project uses the `fake` adapter, so `vichu run`
-works with **no agent CLI installed**.
+**Headless / CI (fallback).** Without a host pack, run a whole workflow from the
+terminal with `vichu exec`:
 
-A run reaches `completed` only when a verification gate passes: `vichu init`
-wires up the gates it detects for your stack (`go test`, `npm test`, …). An
-**empty folder has no gate**, so the run honestly **blocks at `verify`** instead
-of faking success — which is exactly why `vichu new` / `--template` seed one.
-
-To use a real agent, install the
-[Claude Code CLI](https://www.anthropic.com/claude-code) and set the `agents`
-block in `vichu.yaml`:
-
-```yaml
-agents:
-  default:
-    provider: claude-code
-    model: sonnet
+```bash
+vichu exec "add a sum function"       # → completed (gate: go test ./...)
 ```
 
-Then `vichu run "your task"` runs the agent headless and gates its work against
-your tests. Full walkthrough: [Getting started](docs/user/getting-started.md).
+`vichu exec` runs the agent headless and gates its work against your tests.
+(`vichu run "task"` is a deprecated alias for `vichu exec`.) A fresh project uses
+the `fake` adapter, so `exec` works with **no agent CLI installed**; a run reaches
+`completed` only when a verification gate passes. Full walkthrough:
+[Getting started](docs/user/getting-started.md).
 
 > **Cost:** VichuFlow itself is free and open source (MIT) and collects no
 > telemetry. The agents it coordinates are billed by their own providers (e.g.

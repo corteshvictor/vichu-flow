@@ -39,6 +39,7 @@ const (
 	EventReviewFindings         = "review_findings"
 	EventReviewContextTruncated = "review_context_truncated"
 	EventMutationTracked        = "mutation_tracked"
+	EventArtifactSaved          = "artifact_saved"
 	EventOutOfScopeMut          = "out_of_scope_mutation"
 	EventWorkspaceDrift         = "workspace_drift"
 	EventBudgetExceeded         = "budget_exceeded"

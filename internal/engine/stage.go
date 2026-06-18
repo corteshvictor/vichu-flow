@@ -24,26 +24,11 @@ const warnSaveWorkerStatus = "save worker status"
 // and the exact set of files it mutated. It returns advance=false (without
 // error) when a budget guard blocks the run.
 func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runState, stage workflows.Stage) (bool, error) {
-	if blocked := e.checkBudgets(state); blocked != "" {
-		e.emit(state, stage.Name, "", core.EventBudgetExceeded, map[string]any{"reason": blocked})
-		e.block(state, blocked)
-		return false, nil
-	}
-
-	// The agent-invocation budget gates STARTING an agent — not gates or the
-	// terminal stage. Check it here, before incrementing, so a budget of N permits
-	// exactly N agents and still lets verify/done run.
-	if reason := e.agentBudgetExceeded(state); reason != "" {
-		e.emit(state, stage.Name, "", core.EventBudgetExceeded, map[string]any{"reason": reason})
-		e.block(state, reason)
-		return false, nil
-	}
-
-	// Per-stage token budget: if this stage already burned its token cap across
-	// previous iterations (e.g. a review→fix loop), stop before spending more.
-	if reason := e.stageTokenBudgetExceeded(state, stage); reason != "" {
-		e.emit(state, stage.Name, "", core.EventBudgetExceeded, map[string]any{"reason": reason})
-		e.block(state, reason)
+	// Budget gates that must pass BEFORE starting an agent — run-level, agent
+	// invocation (so a budget of N permits exactly N agents and still lets
+	// verify/done run), and the per-stage token cap (stops a review→fix loop that
+	// already burned its budget). Any one blocks the run.
+	if e.preWorkerBudgetBlocked(state, stage) {
 		return false, nil
 	}
 
@@ -123,19 +108,9 @@ func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runS
 
 	// Aggregate usage/cost for ANY worker that ran — an adapter can report real
 	// cost/tokens even on an error result (claude-code does), so the run's budget
-	// must reflect what was actually burned, not just successful workers. Emit
-	// token_usage too: a failed worker's spend is still part of the timeline.
-	state.Budgets.CostUSDSpent += result.CostUSD
-	state.Budgets.TokensInSpent += result.TokensIn
-	state.Budgets.TokensOutSpent += result.TokensOut
+	// must reflect what was actually burned, not just successful workers.
+	e.accrueReportedUsage(state, stage.Name, workerID, result)
 	state.Budgets.WallClockSpentSeconds = rs.wallClockSpent()
-	addStageTokens(state, stage.Name, result.TokensIn, result.TokensOut)
-	if result.TokensIn > 0 || result.TokensOut > 0 {
-		e.emit(state, stage.Name, workerID, "token_usage", map[string]any{
-			"tokens_in": result.TokensIn, "tokens_out": result.TokensOut,
-			"run_tokens_total": state.Budgets.TokensTotalSpent(),
-		})
-	}
 
 	if err != nil {
 		return e.handleWorkerError(ctx, state, ws, workerID, err)
@@ -156,6 +131,19 @@ func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runS
 	if policyBlock != "" {
 		e.block(state, policyBlock)
 		return false, nil
+	}
+	// Materialize the stage's default artifact (propose → proposal.md, plan →
+	// plan.md) from the worker's result — the same kernel-owned step host-first does
+	// in `worker complete`, so SDD artifacts exist for the required-artifact gate
+	// whether the run is driven headless or by a host. For a stage that requires its
+	// artifact this is contract evidence, so a persist failure BLOCKS rather than
+	// silently advancing. No-op for stages with no default artifact (explore,
+	// implement, fix) and for review stages.
+	if stage.Kind == workflows.KindWorker {
+		if aerr := e.materializeArtifacts(state, stage.Name, workerID, result.Markdown, nil); aerr != nil {
+			e.block(state, fmt.Sprintf("stage %q: cannot persist its artifact: %v", stage.Name, aerr))
+			return false, nil
+		}
 	}
 	if stage.Kind == workflows.KindReview {
 		return e.applyVerdict(state, stage, result), nil
@@ -393,7 +381,7 @@ func (e *Engine) trackMutations(state *core.State, stage workflows.Stage, worker
 		Worker: workerID, Stage: stage.Name, BaseSHA: baseSHA,
 		Mutations: muts, CapturedAt: time.Now().UTC(),
 	}
-	e.warn(e.store.SaveMutationReport(state.RunID, workerID, report), "save mutation report")
+	e.criticalWrite(e.store.SaveMutationReport(state.RunID, workerID, report), "save mutation report")
 	e.emit(state, stage.Name, workerID, core.EventMutationTracked, map[string]any{"count": len(muts)})
 	for _, m := range muts {
 		if m.OutOfScope {
@@ -470,14 +458,14 @@ func mutationPolicyVerdict(stage workflows.Stage, muts []core.Mutation, sec conf
 }
 
 func (e *Engine) persistWorkerResult(runID, workerID string, result core.Result) {
-	e.warn(e.store.WriteWorkerFile(runID, workerID, "result.md", []byte(result.Markdown)), "write worker result")
+	e.criticalWrite(e.store.WriteWorkerFile(runID, workerID, "result.md", []byte(result.Markdown)), "write worker result")
 	if data, err := json.MarshalIndent(result, "", "  "); err == nil {
-		e.warn(e.store.WriteWorkerFile(runID, workerID, "result.json", append(data, '\n')), "write worker result json")
+		e.criticalWrite(e.store.WriteWorkerFile(runID, workerID, "result.json", append(data, '\n')), "write worker result json")
 	}
 	if result.SessionID != "" {
 		session := map[string]string{"session_id": result.SessionID}
 		if data, err := json.MarshalIndent(session, "", "  "); err == nil {
-			e.warn(e.store.WriteWorkerFile(runID, workerID, "session.json", append(data, '\n')), "write worker session")
+			e.criticalWrite(e.store.WriteWorkerFile(runID, workerID, "session.json", append(data, '\n')), "write worker session")
 		}
 	}
 }
@@ -524,6 +512,51 @@ func addStageTokens(state *core.State, stage string, in, out int) {
 	}
 	state.Budgets.StageTokensIn[stage] += in
 	state.Budgets.StageTokensOut[stage] += out
+}
+
+// accrueReportedUsage adds the cost/tokens a worker actually reported to the run
+// budget and emits a token_usage event. Cost and tokens are independent (codex
+// reports tokens but not USD cost), so an unreported dimension is left untouched —
+// it stays "unknown" rather than accruing a fake zero. Shared by the headless
+// runner (stage.go) and the host-first close path (applyUsage) so both account
+// usage identically.
+func (e *Engine) accrueReportedUsage(state *core.State, stageName, workerID string, r core.Result) {
+	if r.CostReported {
+		state.Budgets.CostReported = true
+		state.Budgets.CostUSDSpent += r.CostUSD
+	}
+	if !r.TokensReported {
+		return
+	}
+	state.Budgets.TokensReported = true
+	state.Budgets.TokensInSpent += r.TokensIn
+	state.Budgets.TokensOutSpent += r.TokensOut
+	addStageTokens(state, stageName, r.TokensIn, r.TokensOut)
+	if r.TokensIn > 0 || r.TokensOut > 0 {
+		e.emit(state, stageName, workerID, "token_usage", map[string]any{
+			"tokens_in": r.TokensIn, "tokens_out": r.TokensOut,
+			"run_tokens_total": state.Budgets.TokensTotalSpent(),
+		})
+	}
+}
+
+// preWorkerBudgetBlocked runs the budget gates that must pass before starting an
+// agent (run-level, agent-invocation, per-stage tokens) in order; it emits the
+// budget event, blocks the run, and returns true on the first one exhausted.
+func (e *Engine) preWorkerBudgetBlocked(state *core.State, stage workflows.Stage) bool {
+	gates := []func() string{
+		func() string { return e.checkBudgets(state) },
+		func() string { return e.agentBudgetExceeded(state) },
+		func() string { return e.stageTokenBudgetExceeded(state, stage) },
+	}
+	for _, gate := range gates {
+		if reason := gate(); reason != "" {
+			e.emit(state, stage.Name, "", core.EventBudgetExceeded, map[string]any{"reason": reason})
+			e.block(state, reason)
+			return true
+		}
+	}
+	return false
 }
 
 // stageTokenBudgetExceeded returns a non-empty reason when a stage has already

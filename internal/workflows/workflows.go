@@ -30,7 +30,13 @@ type Stage struct {
 	Scope       []string // expected mutation scope globs (empty = unrestricted)
 	ReadOnly    bool     // worker stages: any mutation blocks the run
 	Instruction string   // worker stages: what to tell the agent
-	Next        string   // next stage (worker/gate stages); "" only for terminal
+	// RequiresArtifact, when set, makes `stage close` block unless that artifact
+	// exists; RequiresArtifactSection additionally requires a "## <section>"
+	// heading in it. Used to enforce TDD intent: the sdd `plan` stage must produce
+	// a `plan` artifact with a `## Tests` section before implementing.
+	RequiresArtifact        string
+	RequiresArtifactSection string
+	Next                    string // next stage (worker/gate stages); "" only for terminal
 	// Review stages (KindReview) transition on the verdict, not Next. A "blocked"
 	// verdict has no target — it blocks the run for a human.
 	NextOnApproved   string // verdict "approved"   → advance here
@@ -43,6 +49,24 @@ type Workflow struct {
 	Start  string
 	Stages []Stage
 }
+
+// exploreInstruction is the shared read-only explore prompt (all workflows).
+const exploreInstruction = "Explore the repository and summarize what is relevant to the task. Do not modify files."
+
+// implementInstruction is the shared implement prompt (all workflows).
+const implementInstruction = "Implement the task. Make the minimal change needed and keep it consistent with the project's conventions."
+
+// fixInstruction is the shared fix-loop prompt (review + sdd workflows).
+const fixInstruction = "Address the reviewer's findings from the previous review. Make the minimal changes needed; do not introduce unrelated changes."
+
+// reviewInstruction is the shared reviewer prompt (review + sdd workflows): judge
+// the implementation and END with a single structured-verdict JSON object.
+const reviewInstruction = "Review the implementation against the task. Investigate as needed, then END your " +
+	"reply with a single JSON object on its own line and NOTHING after it:\n" +
+	"{\"status\": \"approved\" | \"needs_fixes\" | \"blocked\", \"summary\": \"<one line>\", " +
+	"\"findings\": [{\"severity\": \"blocker\" | \"major\" | \"minor\", \"file\": \"<path>\", \"message\": \"<what to fix>\"}]}\n" +
+	"Use \"approved\" if it is correct and complete; \"needs_fixes\" (with findings) if there are " +
+	"defects to address; \"blocked\" if the task cannot be done safely or is underspecified."
 
 // Stage looks up a stage by name.
 func (w *Workflow) Stage(name string) (Stage, bool) {
@@ -66,14 +90,14 @@ func Quick() *Workflow {
 				Kind:        KindWorker,
 				Role:        "explorer",
 				ReadOnly:    true, // enforced by the runtime, not just the prompt
-				Instruction: "Explore the repository and summarize what is relevant to the task. Do not modify files.",
+				Instruction: exploreInstruction,
 				Next:        "implement",
 			},
 			{
 				Name:        "implement",
 				Kind:        KindWorker,
 				Role:        "implementer",
-				Instruction: "Implement the task. Make the minimal change needed and keep it consistent with the project's conventions.",
+				Instruction: implementInstruction,
 				Next:        "verify",
 			},
 			{
@@ -104,27 +128,22 @@ func Review() *Workflow {
 				Kind:        KindWorker,
 				Role:        "explorer",
 				ReadOnly:    true,
-				Instruction: "Explore the repository and summarize what is relevant to the task. Do not modify files.",
+				Instruction: exploreInstruction,
 				Next:        "implement",
 			},
 			{
 				Name:        "implement",
 				Kind:        KindWorker,
 				Role:        "implementer",
-				Instruction: "Implement the task. Make the minimal change needed and keep it consistent with the project's conventions.",
+				Instruction: implementInstruction,
 				Next:        "review",
 			},
 			{
-				Name:     "review",
-				Kind:     KindReview,
-				Role:     "reviewer",
-				ReadOnly: true, // a reviewer judges; it must not change the tree
-				Instruction: "Review the implementation against the task. Investigate as needed, then END your " +
-					"reply with a single JSON object on its own line and NOTHING after it:\n" +
-					"{\"status\": \"approved\" | \"needs_fixes\" | \"blocked\", \"summary\": \"<one line>\", " +
-					"\"findings\": [{\"severity\": \"blocker\" | \"major\" | \"minor\", \"file\": \"<path>\", \"message\": \"<what to fix>\"}]}\n" +
-					"Use \"approved\" if it is correct and complete; \"needs_fixes\" (with findings) if there are " +
-					"defects to address; \"blocked\" if the task cannot be done safely or is underspecified.",
+				Name:             "review",
+				Kind:             KindReview,
+				Role:             "reviewer",
+				ReadOnly:         true, // a reviewer judges; it must not change the tree
+				Instruction:      reviewInstruction,
 				NextOnApproved:   "verify",
 				NextOnNeedsFixes: "fix",
 			},
@@ -132,7 +151,84 @@ func Review() *Workflow {
 				Name:        "fix",
 				Kind:        KindWorker,
 				Role:        "implementer",
-				Instruction: "Address the reviewer's findings from the previous review. Make the minimal changes needed; do not introduce unrelated changes.",
+				Instruction: fixInstruction,
+				Next:        "review",
+			},
+			{
+				Name:  "verify",
+				Kind:  KindGate,
+				Gates: []string{"test", "lint", "typecheck"},
+				Next:  "done",
+			},
+			{
+				Name: "done",
+				Kind: KindTerminal,
+			},
+		},
+	}
+}
+
+// SDD is the spec-driven workflow: the agent proposes and plans before
+// implementing, then an adversarial review gates the result —
+// explore → propose → plan → implement → review → (approved: verify → done) /
+// (needs_fixes: fix → review). propose/plan are read-only and produce the
+// `proposal` and `plan` artifacts (persisted by the kernel under artifacts/).
+func SDD() *Workflow {
+	return &Workflow{
+		Name:  "sdd",
+		Start: "explore",
+		Stages: []Stage{
+			{
+				Name:        "explore",
+				Kind:        KindWorker,
+				Role:        "explorer",
+				ReadOnly:    true,
+				Instruction: exploreInstruction,
+				Next:        "propose",
+			},
+			{
+				Name:        "propose",
+				Kind:        KindWorker,
+				Role:        "proposer",
+				ReadOnly:    true, // a proposal is a document, not a code change
+				Instruction: "Propose WHAT to change and WHY for the task — scope, approach, and risks — as a short markdown document. Do not modify code. Provide it as the `proposal` artifact.",
+				// The proposal is a contract, not just a prompt: the kernel blocks this
+				// stage unless a non-empty `proposal` artifact was produced.
+				RequiresArtifact: "proposal",
+				Next:             "plan",
+			},
+			{
+				Name:        "plan",
+				Kind:        KindWorker,
+				Role:        "planner",
+				ReadOnly:    true, // a plan is a document, not a code change
+				Instruction: "Break the proposal into a concrete, verifiable plan: ordered steps and a `## Tests` section declaring the tests that will prove each one. Do not modify code. Provide it as the `plan` artifact.",
+				// TDD intent is enforced, not just requested: the plan must declare tests.
+				RequiresArtifact:        "plan",
+				RequiresArtifactSection: "Tests",
+				Next:                    "implement",
+			},
+			{
+				Name:        "implement",
+				Kind:        KindWorker,
+				Role:        "implementer",
+				Instruction: "Implement the plan. Make the minimal change needed, write the tests the plan declared, and keep it consistent with the project's conventions.",
+				Next:        "review",
+			},
+			{
+				Name:             "review",
+				Kind:             KindReview,
+				Role:             "reviewer",
+				ReadOnly:         true,
+				Instruction:      reviewInstruction,
+				NextOnApproved:   "verify",
+				NextOnNeedsFixes: "fix",
+			},
+			{
+				Name:        "fix",
+				Kind:        KindWorker,
+				Role:        "implementer",
+				Instruction: fixInstruction,
 				Next:        "review",
 			},
 			{
@@ -156,8 +252,10 @@ func Get(name string) (*Workflow, error) {
 		return Quick(), nil
 	case "review":
 		return Review(), nil
+	case "sdd":
+		return SDD(), nil
 	default:
-		return nil, fmt.Errorf("unknown workflow %q (built-in: quick, review)", name)
+		return nil, fmt.Errorf("unknown workflow %q (built-in: quick, review, sdd)", name)
 	}
 }
 

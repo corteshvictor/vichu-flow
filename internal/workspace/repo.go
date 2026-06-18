@@ -35,6 +35,11 @@ func (r *Repo) Root() string { return r.root }
 // Kind names this backend; it satisfies Provider.Kind.
 func (r *Repo) Kind() string { return KindGit }
 
+// ResumeTracking reconstructs a Tracker from a persisted before-snapshot.
+func (r *Repo) ResumeTracking(before map[string]core.FileSig) *Tracker {
+	return resumeTracker(r, before)
+}
+
 // Snapshot captures the current git state: base commit, branch, and the set of
 // dirty paths. It is persisted to workspace.json and compared on resume.
 func (r *Repo) Snapshot(isolation string) (*core.Workspace, error) {

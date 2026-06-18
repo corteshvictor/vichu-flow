@@ -29,8 +29,18 @@ documents the layout and schemas for `schema_version: 1`.
   reviews/<stage>/iteration-<n>/
     verdict.json          # validated review verdict for that iteration
   summaries/<stage>.md    # bounded per-stage summary passed to later stages
-  artifacts/              # workflow artifacts
+  artifacts/              # named workflow artifacts (e.g. proposal.md, plan.md)
+  operations/<op-id>.json # host-first idempotency record (see below)
 ```
+
+Host-first transactional commands (`worker complete`, `review complete`,
+`stage close`) accept an `--op-id`. The kernel records each one's result under
+`operations/<op-id>.json` so a retry with the same id returns the same result
+without re-applying. `run start --op-id` is recorded globally under
+`.vichu/operations/run-start/<op-id>.json` (the run does not exist yet). Fields:
+`kind` (`worker.complete` / `stage.close` / `run-start` / …), `fp` (a digest of
+the operation's identifying args — reusing an op-id for a different operation is
+rejected), and the cached `worker_id` / `run_id` / `block_reason`.
 
 With the `filesystem` workspace provider, a sibling `.vichu/baseline/` holds the
 tree copy that run snapshots are taken against (plus `baseline.manifest` and
@@ -51,7 +61,7 @@ gitignored, never counted as a worker mutation, and safe to delete between runs.
   "current_stage": "implement",
   "stages": { "explore": "done", "implement": "active", "verify": "pending", "done": "pending" },
   "iterations": {},
-  "budgets": { "cost_usd_spent": 0, "wall_clock_spent_seconds": 12.4, "agent_invocations": 2, "tokens_in_spent": 1200, "tokens_out_spent": 450 },
+  "budgets": { "cost_usd_spent": 0, "wall_clock_spent_seconds": 12.4, "agent_invocations": 2, "tokens_in_spent": 1200, "tokens_out_spent": 450, "tokens_reported": true, "cost_reported": false },
   "active_worker": "implement-02",
   "blocked_reason": "",
   "next_action": "running implementer",
@@ -64,6 +74,16 @@ gitignored, never counted as a worker mutation, and safe to delete between runs.
 `failed`. Stage status is one of `pending`, `active`, `done`, `skipped`,
 `failed`. State is written atomically (temp file + rename), so a reader never
 sees a half-written file.
+
+`budgets.tokens_reported` and `budgets.cost_reported` are independent: each turns
+`true` once any worker reported that kind of usage. Invocations and wall-clock are
+always kernel-measured; tokens and cost are only known when the runner (headless)
+or host (native) exposes them, and a source may surface one but not the other —
+**codex reports tokens but not USD cost**, so a codex run has `tokens_reported:
+true, cost_reported: false`. When a flag is `false`, that spend is **unknown**, not
+a real zero: `vichu status` renders "cost unknown" / "tokens unknown", and `status
+--json` emits `null` for `cost_usd` (or `tokens_total`) while the other may still
+carry a real value.
 
 ## events.ndjson
 

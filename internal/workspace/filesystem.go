@@ -47,6 +47,11 @@ func (w *FilesystemWorkspace) Root() string { return w.root }
 // Kind names this backend; it satisfies Provider.Kind.
 func (w *FilesystemWorkspace) Kind() string { return KindFilesystem }
 
+// ResumeTracking reconstructs a Tracker from a persisted before-snapshot.
+func (w *FilesystemWorkspace) ResumeTracking(before map[string]core.FileSig) *Tracker {
+	return resumeTracker(w, before)
+}
+
 func (w *FilesystemWorkspace) baselinePath() string {
 	return filepath.Join(w.root, runtimeDirName, "baseline")
 }
