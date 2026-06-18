@@ -11,6 +11,13 @@ Refactors), in the spirit of [Keep a Changelog](https://keepachangelog.com).
 
 <!-- release-please will insert released versions below this line. -->
 
+## [0.4.0](https://github.com/corteshvictor/vichu-flow/compare/v0.3.0...v0.4.0) (2026-06-18)
+
+
+### Features
+
+* host-first runtime — drive verified runs from inside your coding agent ([#21](https://github.com/corteshvictor/vichu-flow/issues/21)) ([7e85053](https://github.com/corteshvictor/vichu-flow/commit/7e8505345e84760291d77e2797ad6477746240e7))
+
 ## [0.3.0](https://github.com/corteshvictor/vichu-flow/compare/v0.2.1...v0.3.0) (2026-06-14)
 
 
