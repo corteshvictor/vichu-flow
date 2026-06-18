@@ -5,12 +5,16 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
 
 	rt "github.com/corteshvictor/vichu-flow/internal/runtime"
 )
+
+// reRunID extracts a run id from a command's human output ("Created run run-… ").
+var reRunID = regexp.MustCompile(`run-[0-9a-z-]+`)
 
 // captureStdout runs fn with os.Stdout redirected to a pipe and returns what was
 // written. Engine progress logs go to stderr (not captured), so this proves a
@@ -75,12 +79,25 @@ func TestStageCloseJSONIsPure(t *testing.T) {
 
 	// drive a quick run up to (but not closing) verify. createFile toggles whether the
 	// `test -f feature.go` gate will pass, so we can reach both a completed and a
-	// blocked verify close.
+	// blocked verify close. The run id is parsed from `run start`'s output and used
+	// explicitly throughout — NOT resolved via LatestRun, which is ambiguous once a
+	// second run shares the same timestamp-second (the macOS-CI flake).
 	drive := func(task string, createFile bool) string {
-		cli(cmdRunStart, "--workflow", "quick", task)
-		rid := runID(t, store)
+		out := captureStdout(t, func() { cli(cmdRunStart, "--workflow", "quick", task) })
+		rid := reRunID.FindString(out)
+		if rid == "" {
+			t.Fatalf("could not parse run id from run start output: %q", out)
+		}
+		// activeWorker resolves the worker from THIS run's state (explicit rid).
+		activeWorker := func() string {
+			st, err := store.LoadState(rid)
+			if err != nil || st.ActiveWorker == "" {
+				t.Fatalf("no active worker for %s: %v", rid, err)
+			}
+			return st.ActiveWorker
+		}
 		cli(cmdWorker, "start", "--run", rid, "--stage", "explore", "--role", "explorer")
-		cli(cmdWorker, "complete", "--run", rid, "--worker", activeWorker(t, store))
+		cli(cmdWorker, "complete", "--run", rid, "--worker", activeWorker())
 		cli(cmdStage, "close", "--run", rid, "--stage", "explore")
 		cli(cmdWorker, "start", "--run", rid, "--stage", "implement", "--role", "implementer")
 		if createFile {
@@ -88,7 +105,7 @@ func TestStageCloseJSONIsPure(t *testing.T) {
 		} else {
 			_ = os.Remove(feat)
 		}
-		cli(cmdWorker, "complete", "--run", rid, "--worker", activeWorker(t, store))
+		cli(cmdWorker, "complete", "--run", rid, "--worker", activeWorker())
 		cli(cmdStage, "close", "--run", rid, "--stage", "implement")
 		return rid
 	}
