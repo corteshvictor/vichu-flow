@@ -62,6 +62,18 @@ macOS, and Windows. Keep dependencies minimal (one runtime dependency: `yaml.v3`
   `cargo test`. For Node, never use npm — use **pnpm** if a package manager is
   ever needed.
 
+## Repo agent tooling (`.agents/`)
+
+`.agents/` (the repo-root `.claude` symlinks to it) is tooling for agents working
+**on this repo** — it is **not** the product and is never installed into a user's
+project. Don't confuse it with VichuFlow's **host packs**
+(`internal/hostpacks/packs/...`), which ARE the product (`vichu init --host` installs
+those). Under `.agents/skills/`: `commit` (first-party), and `frontend-design` +
+`skill-creator` **vendored from `anthropics/skills`** (Apache-2.0) for the planned
+web/docs work and for creating/validating this repo's skills. The vendored ones are
+pinned by source+hash in the repo-root `skills-lock.json`; commit it together with
+any skill change. See `.agents/README.md` for the human-facing detail.
+
 ## Pointers
 
 - `CONTRIBUTING.md` — workflow and commit convention.
