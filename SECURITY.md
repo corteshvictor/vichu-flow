@@ -39,9 +39,9 @@ with a name close to a real one). Mitigations we follow:
 - Keep the dependency count near zero; prefer the standard library.
 - Pin versions (the default) and review Dependabot PRs rather than auto-merging.
 
-## Future web dashboard supply chain (v0.5)
+## Future web dashboard supply chain (v0.6)
 
-The web dashboard (`web/`, planned for v0.5) is the only surface that will pull
+The web dashboard (`web/`, planned for v0.6) is the only surface that will pull
 third-party JavaScript dependencies. It will use **pnpm only** (never npm), with
 these controls in `pnpm-workspace.yaml`:
 
@@ -63,6 +63,17 @@ the project ships a single Go-runtime dependency and no JS.
 ## Runtime safety
 
 Beyond dependencies, VichuFlow's runtime enforces safety while orchestrating
-agents — a central command policy that blocks dangerous commands before they
-run, git workspace snapshots, per-worker mutation tracking, and hard budgets.
-See [docs/user/configuration.md](docs/user/configuration.md#security).
+agents — workspace snapshots, per-worker mutation tracking, and hard budgets.
+How command prevention applies depends on the run mode:
+
+- **When VichuFlow runs the command** — verification gates, `shell` workers, and
+  the headless `claude-code`/`codex` adapters — a central command policy blocks
+  dangerous commands (`rm -rf`, `git push`, installs) **before they run**.
+- **Host-first native** (the installed host pack, where Claude Code runs its own
+  subagents) — VichuFlow does not launch the agent, so preventive control is the
+  host's (Claude Code permissions / `.claude/settings.json`). VichuFlow's guarantee
+  is **detection, not prevention**: it audits every worker's mutations and **blocks
+  the run from advancing** on a violation.
+
+See [docs/user/configuration.md](docs/user/configuration.md#security) for the full
+two-mode breakdown.

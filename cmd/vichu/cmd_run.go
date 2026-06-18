@@ -13,8 +13,36 @@ import (
 	"github.com/corteshvictor/vichu-flow/internal/i18n"
 )
 
+// runSubcommands maps `vichu run <verb>` lifecycle verbs to their handlers. The
+// `run` namespace operates a run's lifecycle (host-first); running a whole
+// workflow headless is `vichu exec`.
+var runSubcommands = map[string]func([]string) error{
+	"start":  cmdRunStart,
+	"resume": cmdRunResume,
+}
+
+// cmdRun dispatches the `run` namespace. `vichu run <verb>` (e.g. `run start`)
+// operates a run's lifecycle; the bare `vichu run "task"` form is a deprecated
+// alias for `vichu exec` (run a full workflow headless).
 func cmdRun(args []string) error {
-	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	if len(args) > 0 {
+		if h, ok := runSubcommands[args[0]]; ok {
+			return h(args[1:])
+		}
+	}
+	fmt.Fprintln(os.Stderr, i18n.T("run.exec_renamed"))
+	return cmdExec(args)
+}
+
+// cmdExec runs a full workflow headless to completion — the fallback / CLI mode.
+// The host-first experience drives runs from inside the agent instead (§ host
+// packs); this is for CI, automation, and hosts without integration. `exec
+// resume` continues an existing run headless.
+func cmdExec(args []string) error {
+	if len(args) > 0 && args[0] == "resume" {
+		return cmdExecResume(args[1:])
+	}
+	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
 	workflow := fs.String("workflow", "", i18n.T("run.flag_workflow"))
 	// Note: this is the workflow provider label, not the workspace provider — the
 	// latter is project-level config (workspace.provider / `vichu init --provider`).
@@ -58,6 +86,54 @@ func cmdRun(args []string) error {
 	printStateSummary(state)
 	fmt.Printf("\n"+i18n.T("run.observe")+"\n", state.RunID)
 	return runStatusError(state)
+}
+
+// cmdRunStart materializes a run WITHOUT executing it — the host-first lifecycle
+// entry point. It prints the new run id (or JSON) so the host can then drive the
+// workers and call the transactional commands to audit and advance the run.
+func cmdRunStart(args []string) error {
+	fs := flag.NewFlagSet("run start", flag.ContinueOnError)
+	workflow := fs.String("workflow", "", i18n.T("run.flag_workflow"))
+	taskFlag := fs.String("task", "", i18n.T("run.flag_task"))
+	opID := fs.String("op-id", "", i18n.T("op.flag_id"))
+	jsonOut := fs.Bool("json", false, i18n.T("run.flag_json"))
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	positional := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if *taskFlag != "" && positional != "" {
+		return errors.New(i18n.T("run.task_both"))
+	}
+	task := *taskFlag
+	if task == "" {
+		task = positional
+	}
+	if task == "" {
+		return errors.New(i18n.T("run.need_task"))
+	}
+
+	proj, err := openProject()
+	if err != nil {
+		if config.IsNotFound(err) {
+			return errors.New(i18n.T("run.no_config"))
+		}
+		return err
+	}
+
+	state, err := proj.engineForOutput(*jsonOut).StartRun(task, *workflow, *opID)
+	if err != nil {
+		return err
+	}
+
+	if *jsonOut {
+		return printJSON(map[string]string{
+			"run_id": state.RunID,
+			"status": string(state.Status),
+			"stage":  state.CurrentStage,
+		})
+	}
+	fmt.Printf(i18n.T("run.started")+"\n", state.RunID, state.CurrentStage)
+	return nil
 }
 
 // runStatusError turns a non-success terminal run state into a non-zero exit, so

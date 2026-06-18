@@ -25,6 +25,14 @@ const (
 // (v0.3) filesystem providers. It also returns the files it truncated or omitted
 // for the context budget, so the caller can record the truncation (never
 // silent). Returns "" when nothing changed.
+//
+// NOTE (token efficiency, planned): this sends each changed file's FULL (capped)
+// content, not unified-diff hunks. Sending hunks would spend fewer tokens on large
+// files with small edits. Doing that portably needs a provider-level diff API (git:
+// `git diff --unified=N`; filesystem: a unified diff of `.vichu/baseline/<path>` vs
+// the live file), which pulls in a diff algorithm we don't yet carry — so it's a
+// deliberate follow-up, not a silent gap. The per-file/total byte caps below bound
+// the cost in the meantime, and any truncation is recorded in the timeline.
 func (e *Engine) reviewChangeset(state *core.State) (text string, truncated, omitted []string) {
 	paths := e.changedPaths(state)
 	if len(paths) == 0 {

@@ -47,6 +47,13 @@ type BudgetState struct {
 	AgentInvocations      int     `json:"agent_invocations"`
 	TokensInSpent         int     `json:"tokens_in_spent"`
 	TokensOutSpent        int     `json:"tokens_out_spent"`
+	// TokensReported / CostReported are true once any worker reported that kind of
+	// usage. Invocations and wall-clock are always kernel-measured; tokens and cost
+	// are only known when the runner (headless) or host (native) exposes them — and
+	// they are independent (codex reports tokens but not USD cost). When a flag is
+	// false, status renders that field "unknown" rather than a misleading zero.
+	TokensReported bool `json:"tokens_reported,omitempty"`
+	CostReported   bool `json:"cost_reported,omitempty"`
 	// Per-stage token spend, aggregated across a stage's iterations, for
 	// budgets.stage.<stage>.max*Tokens.
 	StageTokensIn  map[string]int `json:"stage_tokens_in,omitempty"`

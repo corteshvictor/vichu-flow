@@ -33,24 +33,37 @@ conventions; set `en` or `es` to force a language in worker prompts.
 
 ```yaml
 workflow:
-  default: quick          # quick | review — which workflow `vichu run` uses without --workflow
+  default: quick          # quick | review | sdd — the default workflow when none is given
   provider: ""            # optional workflow provider label; recorded on the run
   maxAutoIterations: 5    # review loop: max review iterations before blocking
   reviewContext: diff-only  # diff-only | full — what the reviewer's prompt carries
   requireGates: true      # block (don't "complete") when no verify gates are configured
 ```
 
-- `default` — `quick` (explore → implement → verify) or `review` (adds an
-  adversarial review → auto-fix loop).
+Built-in workflows:
+
+- **`quick`** — explore → implement → verify. Minimal.
+- **`review`** — adds an adversarial review → auto-fix loop on a structured verdict.
+- **`sdd`** — spec-driven: explore → propose → plan → implement → review →
+  (approved: verify → done, needs_fixes: fix → review).
+  `propose`/`plan` are read-only and produce the `proposal`/`plan` artifacts; the
+  `plan` must declare a `## Tests` section (TDD intent) or the kernel blocks it.
+
+- `default` — the workflow used when a run names none: `quick` (explore →
+  implement → verify), `review` (adds an adversarial review → auto-fix loop), or
+  `sdd` (spec-driven; `propose`/`plan` artifacts with a required `## Tests`
+  section). See the three above.
 - `maxAutoIterations` — for the `review` workflow, the most review iterations the
   auto-fix loop runs before it blocks for a human (counts reviews: N reviews
   allow up to N−1 auto-fixes, and the Nth review can still approve). Override per
   stage with `budgets.stage.review.maxIterations`.
 - `reviewContext` — `diff-only` (default) gives the reviewer the changed files
-  and their content (built from the run's mutation reports) so it judges the
-  change without re-reading the whole repo — fewer tokens, less free exploration.
-  `full` gives only the task and lets the reviewer explore. Pair with
-  `budgets.stage.review.maxTotalTokens` to cap the review loop's spend.
+  and their (byte-capped) content, built from the run's mutation reports, so it
+  judges the change without re-reading the whole repo — fewer tokens, less free
+  exploration. (Today it sends full file content, not unified-diff hunks; hunks are
+  a planned token optimization.) `full` gives only the task and lets the reviewer
+  explore. Pair with `budgets.stage.review.maxTotalTokens` to cap the review loop's
+  spend.
 - `requireGates` — `true` (the value a fresh `vichu init` writes) makes a run
   **block** instead of reporting `completed` when its verify stage wanted gates
   but none are configured — so a run never claims success having verified
@@ -217,6 +230,41 @@ Enforcement is real, not advisory:
 - Wall-clock spend **accumulates across resumes** — resuming never resets the
   meter.
 
+> **Usage availability.** Invocations, wall-clock, and iterations are always
+> measured by the kernel, so those caps **always** apply. Cost and tokens are only
+> known when the agent reports them, and the two are independent — a source may
+> surface one but not the other:
+>
+> | source        | tokens                | cost (USD)            |
+> | ------------- | --------------------- | --------------------- |
+> | `claude-code` | reported              | reported              |
+> | `codex`       | reported              | **unknown**           |
+> | `shell`       | unknown (n/a)         | unknown (n/a)         |
+> | `fake`        | simulated             | simulated             |
+> | native host   | only if it exposes it | only if it exposes it |
+>
+> When a dimension is unknown, the run records it as **unknown** (not `$0.00`):
+> `vichu status` shows "cost unknown" / "tokens unknown" and `status --json` emits
+> `null`. A cap on an unknown dimension has nothing to enforce against — so for
+> **codex**, `maxCostUSD` does not protect you; bound spend with `maxTotalTokens`,
+> `maxAgentInvocations`, and `maxWallClock` instead.
+
+## observability
+
+```yaml
+observability:
+  tui: false      # RESERVED — not yet enforced
+  web: false      # RESERVED — not yet enforced
+  webPort: 3737   # RESERVED — used once the web dashboard ships
+```
+
+Today observability is **text and read-only**: `vichu status [--watch]` and `vichu
+observe <id>` render a run's state, timeline, and evidence from the flat files under
+`.vichu/runs/`. These fields are **reserved** — a rich TUI and a web dashboard are
+planned for a later milestone (v0.6) over the same files; setting them has no effect
+yet. Anything you can see in the CLI you can also read directly from disk
+([runtime-format.md](runtime-format.md)).
+
 ## security
 
 ```yaml
@@ -234,24 +282,37 @@ security:
 
 Enforcement happens at two moments.
 
-**Before execution** (central policy): every command VichuFlow is about to run —
-verification gates and `shell` workers — is classified first. `git push` is
+**Before execution** (central policy): every command VichuFlow itself is about to
+run — verification gates and `shell` workers — is classified first. `git push` is
 blocked while `allowGitMutations: false`; commands classified as
 `destructive_shell` (`rm -rf`, `sudo`, `git reset --hard`, `git clean`, …) or
 `package_install` (`npm install`, `pip install`, …) that appear in
 `requireConfirmationFor` **block the run before running** (in a headless
-runtime, "requires confirmation" means a human must intervene). The same policy
-is translated into Claude Code tool-permission rules (`--disallowedTools`),
-**generated from the same command table the classifier uses** — so a
-`claude-code` worker is denied the same install forms (including global-flag
-variants like `pnpm --filter` or `pip --cache-dir`) inside its own session,
-while plain dual-use commands (`npm test`, `go test`) are never broadly banned.
-Claude's prefix-based rule syntax is coarser than vichu's parser, so vichu's
-pre-execution `CheckCommand` (on gates and shell workers) remains the
-authoritative layer.
+runtime, "requires confirmation" means a human must intervene). This `CheckCommand`
+layer is authoritative for everything the kernel executes directly, in **both** run
+modes.
+
+How far that prevention reaches *into the agent* depends on the run mode:
+
+- **Headless adapter** (`vichu exec`, the `claude-code`/`codex` adapter): the same
+  policy is translated into Claude Code tool-permission rules (`--disallowedTools`),
+  **generated from the same command table the classifier uses** — so a `claude-code`
+  worker is denied the same install forms (including global-flag variants like `pnpm
+  --filter` or `pip --cache-dir`) inside its own session, while plain dual-use
+  commands (`npm test`, `go test`) are never broadly banned. Claude's prefix-based
+  rule syntax is coarser than vichu's parser, so vichu's pre-execution `CheckCommand`
+  remains the authoritative layer.
+- **Host-first native** (the installed host pack — Claude Code drives its own
+  subagents): VichuFlow does **not** inject `--disallowedTools` into the host's
+  sessions; the kernel never launches the agent. Preventive command control there is
+  whatever the host enforces (Claude Code's own permissions / `.claude/settings.json`).
+  VichuFlow's guarantee in this mode is **detection, not prevention**: it audits every
+  worker's mutations after the fact and **blocks the run from advancing** on a
+  violation (below) — the agent can't make the run progress on disallowed changes,
+  even if it managed to make them.
 
 **After every worker** (mutation policy), from the runtime's own diff of the
-working tree:
+working tree — this applies in **both** modes and is the kernel's core guarantee:
 
 - **Sensitive files** (VCS internals, `.vichu/`, CI configs, `vichu.yaml`,
   lockfiles): touching one **blocks the run** by default.

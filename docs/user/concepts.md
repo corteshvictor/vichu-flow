@@ -3,12 +3,29 @@
 VichuFlow has a small number of moving parts. This page explains each and how
 they fit together.
 
+## Host packs vs. adapters (two ways to run agents)
+
+VichuFlow is **host-first**: the main experience is a **host pack** installed into
+the coding agent you already use (`vichu init --host claude-code`). You talk to
+your agent; an orchestrator skill classifies the request, delegates the coding to
+**native subagents**, and drives a verified run by calling the `vichu` kernel for
+everything that must be trustworthy (state, gates, mutation audit, transitions).
+The kernel commands it calls — `run start`, `worker start`/`complete`,
+`review complete`, `stage close`, `run resume` — are transactional, idempotent
+(`--op-id`), and single-writer (only the kernel writes `.vichu/runs`).
+
+**Adapters** are the *fallback*: when there's no host pack (CI, automation, a host
+without integration), `vichu exec` runs the whole workflow headless and launches
+agents itself through an adapter (`claude-code`, `codex`, `shell`, `fake`). Same
+kernel and runtime underneath — the difference is who drives the agents (your host
+vs. the binary). `vichu run "task"` is a deprecated alias for `vichu exec`.
+
 ## Runtime
 
 The **runtime** is the source of truth for a run: a directory of flat files
-under `.vichu/runs/<run-id>/`. The CLI, TUI, and web dashboard are all just views
-over it. Because everything is on disk and written atomically, a run survives a
-crash and can be resumed or audited later. See
+under `.vichu/runs/<run-id>/`. The CLI reads it today; a TUI and web dashboard are
+planned as additional views over the same files. Because everything is on disk and
+written atomically, a run survives a crash and can be resumed or audited later. See
 [runtime-format.md](runtime-format.md) for the exact files.
 
 The guiding rule: **the runtime does not trust the agent.** Anything that can be
@@ -32,9 +49,31 @@ explore → implement → review ─approved→ verify → done
                          └──── fix ←───────┘ needs_fixes
 ```
 
+The `sdd` workflow is spec-driven — it forces a written proposal and a test-first
+plan *before* any code is implemented, then gates the result with the same review
+loop:
+
+```
+explore → propose → plan → implement → review ─approved→ verify → done
+                                          ↑                │
+                                          └──── fix ←───────┘ needs_fixes
+```
+
+`propose` and `plan` are read-only stages that produce **artifacts** the kernel
+materializes and verifies (never the agent): `propose` writes `proposal.md`, and
+`plan` writes `plan.md`, which **must** contain a `## Tests` section — the kernel
+blocks the run before `implement` if it doesn't (test-first intent). Artifact
+names are an allowlist (`proposal`, `plan`, `test_intent`), so an agent can never
+write an arbitrary path. This contract is enforced identically whether the run is
+driven headless (`vichu exec --workflow sdd`) or by a host pack — the kernel owns
+materialization and the required-artifact gate in both.
+
 Each stage is one of four kinds:
 
-- **worker** — invokes an agent (via an adapter) to do work.
+- **worker** — a unit of agent work. Headless (`vichu exec`), the kernel invokes the
+  agent itself via an adapter; host-first, the host pack opens the worker (`worker
+  start`), a native subagent does the work, and the kernel audits it on close —
+  either way the kernel attributes and verifies what changed.
 - **review** — invokes an agent like a worker, then requires a structured
   **verdict** (`approved` / `needs_fixes` / `blocked`) and branches on it. A
   review is not pass/fail: a reviewer asking for changes is `needs_fixes`, which

@@ -92,10 +92,11 @@ jobs:
           rustup default stable
       - name: Rust example
         run: cd examples/rust && cargo test
-      # End-to-end smoke: actually run `vichu run` against each example's
-      # vichu.yaml (fake agent + the example's REAL gate), not just the gate
-      # command in isolation. Proves init-less run → completed → real gate passed.
-      - name: vichu run on each example
+      # End-to-end smoke: actually run `vichu exec` (the headless entry point)
+      # against each example's vichu.yaml (fake agent + the example's REAL gate),
+      # not just the gate command in isolation. Proves init-less run → completed →
+      # real gate passed.
+      - name: vichu exec on each example
         run: |
           set -e
           go build -o /tmp/vichu ./cmd/vichu
@@ -110,9 +111,9 @@ jobs:
               git init -q && git config user.email t@e.com && git config user.name T
               git add -A && git commit -qm seed
               printf '%s' "$fake" > .vichu-fake.json
-              VICHU_FAKE_SCRIPT="$tmp/.vichu-fake.json" /tmp/vichu run "add a feature file"
+              VICHU_FAKE_SCRIPT="$tmp/.vichu-fake.json" /tmp/vichu exec "add a feature file"
               /tmp/vichu status | grep -qE 'status:[[:space:]]+completed' \
-                || { echo "::error::vichu run on examples/$ex did not complete"; /tmp/vichu status; exit 1; }
+                || { echo "::error::vichu exec on examples/$ex did not complete"; /tmp/vichu status; exit 1; }
               test -f feature.txt || { echo "::error::examples/$ex: agent change not persisted"; exit 1; }
               # A `test: auto` vichu.yaml would still complete with NO gate, so assert
               # a REAL gate verdict (passed) plus that the audit recorded the change.

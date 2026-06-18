@@ -27,12 +27,16 @@ type WorkerStatus struct {
 
 // Result is what a worker produces: a human-facing markdown report and an
 // optional machine-readable payload plus usage/cost if the adapter reports it.
+// TokensReported and CostReported are independent: an adapter may surface tokens
+// but not USD cost (codex), so a zero cost must not be mistaken for a real $0.00.
 type Result struct {
-	Markdown    string         `json:"-"`
-	Data        map[string]any `json:"data,omitempty"`
-	CostUSD     float64        `json:"cost_usd,omitempty"`
-	TokensIn    int            `json:"tokens_in,omitempty"`
-	TokensOut   int            `json:"tokens_out,omitempty"`
-	SessionID   string         `json:"session_id,omitempty"`
-	ExitMessage string         `json:"exit_message,omitempty"`
+	Markdown       string         `json:"-"`
+	Data           map[string]any `json:"data,omitempty"`
+	CostUSD        float64        `json:"cost_usd,omitempty"`
+	CostReported   bool           `json:"-"`
+	TokensIn       int            `json:"tokens_in,omitempty"`
+	TokensOut      int            `json:"tokens_out,omitempty"`
+	TokensReported bool           `json:"-"`
+	SessionID      string         `json:"session_id,omitempty"`
+	ExitMessage    string         `json:"exit_message,omitempty"`
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"sort"
@@ -15,19 +16,27 @@ func cmdStatus(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	watch := fs.Bool("watch", false, i18n.T("status.flag_watch"))
 	interval := fs.Duration("interval", 2*time.Second, i18n.T("status.flag_interval"))
-	if err := fs.Parse(args); err != nil {
+	jsonOut := fs.Bool("json", false, i18n.T("run.flag_json"))
+	positionals, err := parseArgsAnyOrder(fs, args)
+	if err != nil {
 		return err
+	}
+	if *jsonOut && *watch {
+		return errors.New(i18n.T("status.json_watch"))
 	}
 
 	proj, err := openProject()
 	if err != nil {
 		return err
 	}
-	runID, err := proj.resolveRunID(fs.Arg(0))
+	runID, err := proj.resolveRunID(firstArg(positionals))
 	if err != nil {
 		return err
 	}
 
+	if *jsonOut {
+		return printStatusJSON(proj, runID)
+	}
 	if !*watch {
 		return printStatus(proj, runID)
 	}
@@ -48,6 +57,84 @@ func cmdStatus(args []string) error {
 		}
 		time.Sleep(*interval)
 	}
+}
+
+// printStatusJSON emits a stable machine-readable snapshot for host packs: the
+// fields they need to decide the next step (drive a worker, close a stage, resume,
+// observe). The schema is a contract — add fields, don't rename.
+func printStatusJSON(proj *project, runID string) error {
+	state, err := proj.store.LoadState(runID)
+	if err != nil {
+		return err
+	}
+	out := map[string]any{
+		"run_id":         state.RunID,
+		"status":         string(state.Status),
+		"workflow":       state.Workflow,
+		"current_stage":  state.CurrentStage,
+		"stages":         orderedStages(state),
+		"active_worker":  state.ActiveWorker,
+		"blocked_reason": state.BlockedReason,
+		"next_action":    state.NextAction,
+		"budgets":        budgetsJSON(state.Budgets),
+	}
+	if lk, err := proj.store.InspectLock(runID); err == nil && lk.Present {
+		out["lock"] = map[string]any{"present": true, "orphaned": lk.Orphaned, "pid": lk.Lock.PID}
+	} else {
+		out["lock"] = map[string]any{"present": false}
+	}
+	out["recent_events"] = recentEventsJSON(proj, runID)
+	return printJSON(out)
+}
+
+// budgetsJSON renders the budget snapshot. Invocations and wall-clock are always
+// kernel-measured; cost and tokens are independent and each is null when its kind
+// was not reported (a host may expose tokens but not cost). cost_reported /
+// tokens_reported tell consumers which case they are in — null means "unknown",
+// not zero.
+func budgetsJSON(b core.BudgetState) map[string]any {
+	out := map[string]any{
+		"agent_invocations": b.AgentInvocations,
+		"wall_clock_sec":    b.WallClockSpentSeconds,
+		"cost_reported":     b.CostReported,
+		"tokens_reported":   b.TokensReported,
+		"cost_usd":          nil,
+		"tokens_total":      nil,
+	}
+	if b.CostReported {
+		out["cost_usd"] = b.CostUSDSpent
+	}
+	if b.TokensReported {
+		out["tokens_total"] = b.TokensTotalSpent()
+	}
+	return out
+}
+
+// orderedStages returns [{name, status}] in workflow order — a list, not a map,
+// so consumers get a stable ordering.
+func orderedStages(state *core.State) []map[string]string {
+	names := orderedStageNames(state)
+	out := make([]map[string]string, 0, len(names))
+	for _, n := range names {
+		out = append(out, map[string]string{"name": n, "status": string(state.Stages[n])})
+	}
+	return out
+}
+
+func recentEventsJSON(proj *project, runID string) []map[string]any {
+	events, err := proj.store.ReadEvents(runID)
+	if err != nil {
+		return nil
+	}
+	start := 0
+	if len(events) > 12 {
+		start = len(events) - 12
+	}
+	out := make([]map[string]any, 0, len(events)-start)
+	for _, ev := range events[start:] {
+		out = append(out, map[string]any{"ts": ev.TS.Format(time.RFC3339), "event": ev.Event, "detail": ev.Detail})
+	}
+	return out
 }
 
 func printStatus(proj *project, runID string) error {
@@ -100,9 +187,26 @@ func printStateSummary(state *core.State) {
 	if state.BlockedReason != "" {
 		row("status.blocked", state.BlockedReason)
 	}
+	cost, tokens := budgetUsageStrings(state.Budgets)
 	row("status.budget", fmt.Sprintf(i18n.T("status.budget_line"),
-		state.Budgets.AgentInvocations, state.Budgets.CostUSDSpent,
-		state.Budgets.WallClockSpentSeconds, state.Budgets.TokensTotalSpent()))
+		state.Budgets.AgentInvocations, cost,
+		state.Budgets.WallClockSpentSeconds, tokens))
+}
+
+// budgetUsageStrings renders the cost and token parts of the budget line. Cost and
+// tokens are independent: a host may report tokens but not cost, so each reads
+// "unknown" on its own when unreported — never a misleading $0.00 / 0 tokens.
+// Invocations and wall-clock are always kernel-measured, rendered by the caller.
+func budgetUsageStrings(b core.BudgetState) (cost, tokens string) {
+	cost = i18n.T("status.cost_unknown")
+	if b.CostReported {
+		cost = fmt.Sprintf(i18n.T("status.cost_value"), b.CostUSDSpent)
+	}
+	tokens = i18n.T("status.tokens_unknown")
+	if b.TokensReported {
+		tokens = fmt.Sprintf(i18n.T("status.tokens_value"), b.TokensTotalSpent())
+	}
+	return cost, tokens
 }
 
 // stageLine renders the stage progress in WORKFLOW order (explore → implement →

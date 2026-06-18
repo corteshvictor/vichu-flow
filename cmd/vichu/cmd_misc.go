@@ -14,21 +14,72 @@ import (
 	"github.com/corteshvictor/vichu-flow/internal/i18n"
 )
 
+// cmdResume is the top-level `vichu resume` — a deprecated alias for the
+// host-first `vichu run resume` (reopen/validate only, does NOT execute). The
+// headless loop-running resume lives at `vichu exec resume`.
 func cmdResume(args []string) error {
-	fs := flag.NewFlagSet("resume", flag.ContinueOnError)
+	fmt.Fprintln(os.Stderr, i18n.T("resume.renamed"))
+	return cmdRunResume(args)
+}
+
+// cmdRunResume is `vichu run resume [--run <id>]` — the HOST-FIRST resume: it
+// reopens and validates the run (provider, drift) and reports state, WITHOUT
+// executing any stage. The host keeps driving via the transactional commands.
+func cmdRunResume(args []string) error {
+	fs := flag.NewFlagSet("run resume", flag.ContinueOnError)
+	run := fs.String("run", "", i18n.T("worker.flag_run"))
 	accept := fs.Bool("accept-changes", false, i18n.T("resume.flag_accept"))
-	if err := fs.Parse(args); err != nil {
+	jsonOut := fs.Bool("json", false, i18n.T("run.flag_json"))
+	positionals, err := parseArgsAnyOrder(fs, args)
+	if err != nil {
+		return err
+	}
+	id := *run // --run takes precedence; a positional id still works
+	if id == "" {
+		id = firstArg(positionals)
+	}
+	proj, err := openProject()
+	if err != nil {
+		return err
+	}
+	runID, err := proj.resolveRunID(id)
+	if err != nil {
+		return err
+	}
+	state, err := proj.engineForOutput(*jsonOut).ReopenRun(runID, engine.ResumeOptions{AcceptChanges: *accept})
+	if err != nil {
+		return err
+	}
+	if *jsonOut {
+		return printStatusJSON(proj, runID)
+	}
+	printStateSummary(state)
+	// An active run is the SUCCESS case for host-first resume (the host keeps
+	// driving). Only a terminal-but-not-completed state is a non-zero exit.
+	if state.Status == core.StatusActive {
+		return nil
+	}
+	return runStatusError(state)
+}
+
+// cmdExecResume is `vichu exec resume [id]` — the HEADLESS resume: it reopens the
+// run AND runs the loop to completion (the kernel drives agents via adapters). For
+// CI/automation; the host-first experience uses `vichu run resume` instead.
+func cmdExecResume(args []string) error {
+	fs := flag.NewFlagSet("exec resume", flag.ContinueOnError)
+	accept := fs.Bool("accept-changes", false, i18n.T("resume.flag_accept"))
+	positionals, err := parseArgsAnyOrder(fs, args)
+	if err != nil {
 		return err
 	}
 	proj, err := openProject()
 	if err != nil {
 		return err
 	}
-	runID, err := proj.resolveRunID(fs.Arg(0))
+	runID, err := proj.resolveRunID(firstArg(positionals))
 	if err != nil {
 		return err
 	}
-
 	fmt.Printf(i18n.T("resume.resuming")+"\n", runID)
 	state, err := proj.newEngine().Resume(context.Background(), runID, engine.ResumeOptions{AcceptChanges: *accept})
 	if err != nil {
@@ -41,14 +92,15 @@ func cmdResume(args []string) error {
 
 func cmdCancel(args []string) error {
 	fs := flag.NewFlagSet("cancel", flag.ContinueOnError)
-	if err := fs.Parse(args); err != nil {
+	positionals, err := parseArgsAnyOrder(fs, args)
+	if err != nil {
 		return err
 	}
 	proj, err := openProject()
 	if err != nil {
 		return err
 	}
-	runID, err := proj.resolveRunID(fs.Arg(0))
+	runID, err := proj.resolveRunID(firstArg(positionals))
 	if err != nil {
 		return err
 	}
