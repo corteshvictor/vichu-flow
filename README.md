@@ -43,11 +43,13 @@ an **external runtime that doesn't trust the agent**.
   `claude-code`/`codex` adapters), a command policy blocks `rm -rf`/`git
   push`/installs **before** they run. In host-first native mode the host (Claude
   Code) runs its own subagents, so preventive control belongs to the host; the
-  kernel's guarantee is that it **audits every mutation and blocks the run from
-  advancing** on a violation — disallowed changes can't move the run forward.
+  kernel's guarantee is that it **audits what each worker changed and blocks the run
+  from advancing** on a violation — disallowed changes can't move the run forward.
+  (One run per working tree; see [Known limits](#known-limits).)
 - **It won't burn your budget.** Hard limits on agent invocations and wall-clock
-  always apply; cost and token caps apply per dimension whenever the agent reports
-  it — `claude-code` reports both, `codex` reports tokens but not USD cost, `shell`
+  always apply (the kernel measures them itself); cost and token caps apply per dimension
+  whenever the agent reports it — though a crash can currently lose a worker's reported usage,
+  see [Known limits](#known-limits) — `claude-code` reports both, `codex` reports tokens but not USD cost, `shell`
   reports neither, and a native host reports whatever it exposes. Together they
   stop runaway loops and surprise bills (see the usage matrix in
   [configuration.md](docs/user/configuration.md#budgets)).
@@ -60,8 +62,8 @@ Three ideas hold it together:
 
 1. **External, observable runtime.** Every run is flat files on disk
    (`state.json` + `events.ndjson`); the CLI is a view today, with a TUI and web
-   dashboard planned on the same data. A run survives a crash, resumes, and is
-   fully auditable.
+   dashboard planned on the same data. A run survives a crash, resumes, and leaves
+   its evidence on disk for anyone to read.
 2. **Verified evidence.** VichuFlow runs your test/lint/typecheck commands
    itself, captures exit code and output, and only that verdict authorizes a
    transition. An agent that claims success without passing the gate does not
@@ -76,7 +78,7 @@ tracked by git tags and `CHANGELOG.md`, not hardcoded here. The current build
 ships:
 
 - **Host packs** (`vichu init --host claude-code`): install the orchestrator skill + native subagents into your coding agent, then drive verified runs by talking to it. The kernel owns state and gates; the host runs the agents.
-- **Host-first kernel commands** the pack drives: `run start` · `worker start`/`complete` · `review complete` · `stage close` · `run resume` · `status --json` · `observe` — transactional, idempotent (`--op-id`), single-writer.
+- **Host-first kernel commands** the pack drives: `run start` · `worker start`/`complete` · `review complete` · `stage close` · `run resume` · `status --json` · `observe` — each takes the run lock, records its evidence, and is retry-safe via `--op-id`. See [Known limits](#known-limits) for where that recovery is still being hardened.
 - `vichu init [--template]`, `new`, `doctor`, `exec` (headless fallback), `status [--watch]`, `cancel`, `adapters`, `config`
 - **Project templates** (`vichu new <name> --template go|node|python|rust|empty`, or `vichu init --template`): scaffold a runnable project with a real gate, so the first run completes from scratch — Git optional
 - Persistent runtime: atomic `state.json`, append-only `events.ndjson`, heartbeat locks with orphan reclaim, cooperative cancel
@@ -95,6 +97,65 @@ ships:
 The architecture is documented in [Concepts](docs/user/concepts.md) and the
 [runtime format](docs/user/runtime-format.md).
 
+## Known limits
+
+VichuFlow is pre-1.0, and the honest version of "what it guarantees" has edges. These are
+real, reproducible, and being fixed — we would rather you knew than found out.
+
+- **One run per working tree.** Two runs in the same folder share the same files. On the
+  `filesystem` provider, starting a second run re-baselines the tree, and a change the first
+  run's worker made can stop looking like a mutation — so it would not be attributed, and
+  would not block. **Finish or cancel a run before starting another in the same folder.**
+- **One process per run.** The run lock is a heartbeat lease, not an OS lock. A process that
+  merely *stalls* for 30s (a suspended laptop, a slow network filesystem, antivirus) can look
+  abandoned and have its run reclaimed. Don't drive one run from two processes, and avoid NFS.
+- **Crash recovery is still being hardened.** A kernel command that dies mid-flight is designed
+  to be safe to retry, and mostly is — but five gaps are known:
+  - **A crash can lose a worker's token/cost accounting.** If the process dies between closing
+    the worker and saving the run's state, the retry recovers the worker but not the usage it
+    reported. A run whose budget is already spent can therefore keep going. **Invocation and
+    wall-clock caps are unaffected** (the kernel measures those itself) — the token and cost
+    caps are the ones that can under-count.
+  - A retry after a failed event write can succeed without re-writing the event.
+  - **An `--op-id` whose record failed to write can be reused for a different operation.** The
+    record that binds an id to its operation is written last; if that write is the thing that
+    fails, the id is free again, and the next command may claim it.
+  - `worker start` can be recovered by a *different* `--op-id` than the one that opened it.
+  - **A gate's rollback is held in memory, so an abrupt kill during the gate loses it.** When a
+    gate misbehaves and changes your tree, the kernel rolls the damage back — but the pre-gate
+    backup lives in RAM until the gate returns. A `SIGKILL` or power loss *while the gate is
+    running* drops it, and resume cannot undo the damage. This is the one crash gap that can lose
+    work; making the gate backup durable before the gate runs is the fix.
+
+  Apart from that last one, none of these lose your code or let an agent skip a gate — they make
+  the audit trail, and one of the budget caps, less complete than the guarantees above claim.
+- **The audit does not look inside an ignored directory.** An ignored *file* (`.env`,
+  `coverage.out`) is captured with its hash and held to the policy. But a path inside an ignored
+  **directory** (`node_modules/`, `dist/`, `target/`) is not audited at all — the subtree
+  collapses to one entry and is skipped, because walking and hashing it before and after every
+  worker would cost far more than it buys. **An agent can hide a file there.** If a directory
+  holds something you would want to know about, ignore the files rather than the directory.
+- **The `filesystem` provider does not track symlinks.** It walks regular files, so a symlink a
+  worker creates is not reported as a mutation. (Rollback is confined either way — it never
+  writes *through* a link, in either provider.)
+- **The run state under `.vichu/` is not yet forgery-proof.** A run's verdict lives in
+  `.vichu/runs/<id>/state.json`, and the coding agent has shell access to the same working tree.
+  Nothing an agent *tells* the kernel is trusted — but an agent that writes that file *directly*
+  (`echo '{"status":"completed"}' > …`) forges the verdict, and because `.vichu/` is the kernel's
+  own runtime it is excluded from the mutation audit, so the write is not flagged. The driver
+  token stops an agent from *driving* the run; it does not yet stop this. Signing the state files
+  with a key the agent never sees is designed and scheduled, not shipped. **Until then, treat the
+  `.vichu/` verdict as trustworthy only against an agent you would already let run your gates —
+  not against a deliberately hostile one with shell access.**
+
+**What does hold, and is the reason to use this at all:** a run reaches `completed` only when the
+kernel ran your tests/lint/typecheck **itself** and they passed — no agent can *talk* its way past
+that by reporting fake results, in any of the situations above. The one caveat is the last bullet:
+an agent with shell access can forge the *record* of that verdict by writing `.vichu/` directly,
+which the signing work closes.
+
+The full list, with acceptance criteria, is tracked in the project's internal plan.
+
 ## Install
 
 VichuFlow is a single self-contained binary — **you do not need Go (or any
@@ -110,9 +171,14 @@ roadmap.
 **3. For Go developers**, you can also install or build from source:
 
 ```bash
-go install github.com/corteshvictor/vichu-flow/cmd/vichu@latest   # Go 1.26+
+go install github.com/corteshvictor/vichu-flow/cmd/vichu@latest   # Go 1.26.5+
 # or:  git clone … && cd vichu-flow && go build -o vichu ./cmd/vichu
 ```
+
+> **Already on an older version?** A new binary does not refresh the host pack already
+> copied into your project — run `vichu init --host claude-code` and restart your agent.
+> `vichu doctor` tells you when a project needs it. See
+> [Upgrading](docs/user/upgrading.md).
 
 > **VichuFlow itself** needs no runtime — no Go, no Git. Git is recommended (the
 > `git` provider is efficient and ties into your history) but optional: in a
@@ -124,19 +190,23 @@ go install github.com/corteshvictor/vichu-flow/cmd/vichu@latest   # Go 1.26+
 
 ## Quick start
 
-**Install the host pack and talk to your agent.** VichuFlow installs into the
-coding agent you already use (Claude Code today); you describe the task in natural
-language and it orchestrates a verified run — the kernel owns the state, runs the
-gates, and decides every transition.
+**Install the host pack, then type `/vichu <your task>` in your agent.** VichuFlow
+installs into the coding agent you already use (Claude Code today); you describe the
+task in natural language and it orchestrates a verified run — the kernel owns the
+state, runs the gates, and decides every transition.
 
 ```bash
 cd your-project                       # a Git repo, or any folder — Git is optional
 vichu init --host claude-code         # install the orchestrator skill + subagents
-# then, inside Claude Code:
-#   "implement password reset using sdd"
-#   "fix the failing login test"
-#   "continue the run"
+# then, inside Claude Code, start the request with /vichu:
+#   /vichu implement password reset using sdd
+#   /vichu fix the failing login test
+#   /vichu continue the run
 ```
+
+`/vichu` is the reliable entry point: it loads the orchestrator explicitly. Whether a
+skill auto-activates on plain natural language is the host's call, not ours — so type
+the slash command and you always get the verified run instead of an ordinary edit.
 
 The orchestrator drives the run through the kernel's transactional commands —
 delegating the coding to native subagents and letting the kernel verify every
@@ -177,6 +247,7 @@ the `fake` adapter, so `exec` works with **no agent CLI installed**; a run reach
 - [Getting started](docs/user/getting-started.md)
 - [Concepts](docs/user/concepts.md)
 - [Configuration](docs/user/configuration.md)
+- [Upgrading](docs/user/upgrading.md)
 - [Runtime format](docs/user/runtime-format.md)
 
 ## Development

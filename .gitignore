@@ -57,3 +57,6 @@ __pycache__/
 .mypy_cache/
 # Rust:
 target/
+
+# packhistory lock
+internal/hostpacks/packs/*/.packhistory.lock

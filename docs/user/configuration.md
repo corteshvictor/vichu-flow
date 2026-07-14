@@ -193,6 +193,14 @@ wrap explicitly: `sh -c '...'` (Unix) or `cmd /c '...'` (Windows).
 
 Hard limits; exhausting any one blocks the run with a clear reason.
 
+> **One honest gap, pre-1.0.** `maxAgentInvocations` and `maxWallClock` are measured by the
+> kernel itself and always hold. The **token and cost caps depend on the agent reporting its
+> usage** — and if the process crashes between closing a worker and saving the run's state, the
+> retry recovers the worker but **not** the usage it reported. A run can therefore keep going on
+> a budget it has already spent. Fixing this properly means reworking the transaction layer, so
+> it is scheduled rather than patched. Until then: after a crash, check `vichu status` before
+> resuming a run with a tight token or cost cap.
+
 ```yaml
 budgets:
   run:
@@ -274,6 +282,8 @@ security:
   sensitiveMutations: block   # block (default) | warn
   outOfScopeMutations: warn   # warn (default) | block
   gateMutations: block        # block (default) | warn | allow
+  gateOutputs: []             # paths a gate MAY rewrite (globs) — see below
+  hostLocalState: warn        # warn (default) | block — see below
   requireConfirmationFor:
     - git_push
     - destructive_shell
@@ -334,18 +344,72 @@ subcommand, and flags inline-code interpreters (`python -c`, `node -e`,
 It is still conservative — it matches well-known dangerous shapes, not every
 possible disguise.
 
+### The one mutation VichuFlow cannot attribute: `hostLocalState`
+
+In **host-first** mode VichuFlow does not launch the agent — your coding host does. That
+host keeps its permission allowlist in `.claude/settings.local.json` and **rewrites it the
+moment you approve a command**, in the middle of a worker, on a file the agent never
+touched. An *agent* could also write that file, to grant itself tools. On disk the two are
+byte-identical, and VichuFlow cannot see which happened.
+
+So it does not pretend to. `hostLocalState` decides:
+
+- **`warn` (default)** — the change is recorded in `mutations.json` (flagged
+  `host_bookkeeping`, with its hash) and announced with its own event, but the run
+  continues. This is the default because blocking would fail a run the first time you
+  approve any command.
+- **`block`** — any change to that file stops the run. Use this when you have
+  pre-authorized every command your agents need, so the file should never move mid-run,
+  and an agent escalating its own host permissions is in your threat model.
+
+Either way the escalation **cannot fool the kernel**: it still runs your gates itself and
+still audits every file the worker touched. What it buys is the host's approval prompt,
+not VichuFlow's verdict.
+
 For **gates specifically** there is a second, effect-based backstop:
-`gateMutations` (default `block`). A gate is a verification command and should
-not change the tree, so VichuFlow diffs the working tree around each gate and —
-if a gate modifies or deletes an **existing tracked or pre-existing untracked
-file** (e.g. via an interpreter the classifier can't read) — blocks the run,
-records `gates/<stage>/<n>/mutations.json`, and **rolls back** that file to its
-pre-gate content (recreating it if deleted), so real user work is not lost. New
-untracked files the gate creates (test caches, coverage) only emit an event and
-are left in place; gitignored artifacts never appear. Set `warn` to record
-without blocking or rolling back, or `allow` to disable the check entirely
-(e.g. for an auto-fixing formatter used as a gate). For workers, mutation
-tracking is always on.
+`gateMutations` (default `block`). A gate is a verification command and should not change
+the tree, so VichuFlow diffs the working tree around each gate. If a gate modifies or
+deletes **a file that already existed** — tracked, untracked, or gitignored — it blocks the
+run, records `gates/<stage>/<n>/mutations.json`, and **rolls back** that file to its
+pre-gate content, mode and type (recreating it if deleted), so real user work is not lost.
+
+A file the gate genuinely **creates** is a different thing: it is recorded and left in
+place, because it is not overwriting anything.
+
+Set `warn` to record without blocking or rolling back, or `allow` to disable the check
+entirely (e.g. for an auto-fixing formatter used as a gate). For workers, mutation tracking
+is always on.
+
+### `gateOutputs` — the paths your gate is *meant* to write
+
+Some gates legitimately rewrite a file every run: a coverage profile, a JUnit report, a
+log. Declare those, and only those:
+
+```yaml
+security:
+  gateOutputs:
+    - coverage.out
+    - reports/*.xml
+```
+
+Globs, matched like a stage's `scope`. **Empty by default: no path is disposable until you
+say so.**
+
+The tempting shortcut would be to infer it — "the file is gitignored, so it must be build
+output." VichuFlow does not, because that sentence also describes a private note, a
+credential, a certificate, a local config, and anything a *global* gitignore excludes that
+this project never mentioned. A gate that overwrites one of those has destroyed something
+irreplaceable, and "it was in your .gitignore" is not a defence. So you declare it.
+
+Two things this cannot do:
+
+- **A sensitive path is never allowed**, whatever you list. `.env` is gitignored precisely
+  *because* it holds secrets; no gate has business rewriting it. Same for lockfiles and CI
+  config.
+- **It does not apply to workers.** A read-only stage that mutated *anything* blocks, and
+  being ignored is not an excuse — an explorer has no business rewriting your coverage file
+  either. The only mutation exempt from the worker policy is the coding host's own
+  `settings.local.json` (see `hostLocalState`).
 
 ## conventions
 
