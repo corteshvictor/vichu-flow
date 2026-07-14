@@ -5,6 +5,14 @@
   "capabilities": { "skills": true, "subagents": true, "slashCommands": true },
   "requires": [{ "bin": "claude", "reason": "the Claude Code CLI runs this pack" }],
   "verify": { "adapter": "claude-code" },
+  "permissions": [
+    "Bash(vichu worker start:*)",
+    "Bash(vichu worker complete:*)",
+    "Bash(vichu review complete:*)",
+    "Bash(vichu stage close:*)",
+    "Bash(vichu status:*)",
+    "Bash(vichu observe:*)"
+  ],
   "files": [
     { "src": "skills/vichu-orchestrator/SKILL.md", "dest": ".claude/skills/vichu-orchestrator/SKILL.md" },
     { "src": "agents/vichu-worker.md", "dest": ".claude/agents/vichu-worker.md" },

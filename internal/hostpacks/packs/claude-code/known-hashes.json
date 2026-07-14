@@ -1,0 +1,17 @@
+{
+  ".claude/agents/vichu-implementer.md": [
+    "39d433db93547c2d506d78aa0a34574488fa95ddf40b481e98f3dcfe19138f5c"
+  ],
+  ".claude/agents/vichu-reviewer.md": [
+    "f1d9b0eb5b1c1f8c8593031e2cac1aa58c478208917ead6e650f7d9a3f2f6b72"
+  ],
+  ".claude/agents/vichu-worker.md": [
+    "af10e6b1d18f771b228994f6aee0d6645f35b3845b79f6a5b0d1aad24a6db75a"
+  ],
+  ".claude/commands/vichu.md": [
+    "e2b3b45423223cc6125d17691024d0815fc6ebbaf09b39f63824c93e34e25888"
+  ],
+  ".claude/skills/vichu-orchestrator/SKILL.md": [
+    "1b50f28bf40af3c80c207bc03f26c65c9437ed72fbe7f4f2c5c58af513c9ca2c"
+  ]
+}
