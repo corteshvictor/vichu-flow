@@ -18,6 +18,12 @@ You do not tag, edit the changelog, or build binaries by hand.
    release-please with `needs` + `if: release_created == 'true'`, so
    **[GoReleaser](https://goreleaser.com)** builds the macOS/Linux/Windows
    binaries and attaches them to the release.
+5. **Also in the same run**, the `record-pack` job records the host pack that
+   this tag shipped (see the next section for *why*) and **opens a `chore: record
+   vX.Y.Z …` PR** with the fixtures and hashes. **Merge that PR** — it is the one
+   manual step left, and until you do, `main` is red on
+   `TestEveryReleasedPackIsRecorded`. (This can only run *after* the tag exists,
+   so it cannot be part of the Release PR that creates the tag.)
 
 > **Why one workflow, not two?** A GitHub Release created with the default
 > `GITHUB_TOKEN` does **not** trigger a separate `on: release` workflow (GitHub
@@ -46,11 +52,16 @@ Homebrew, Scoop, and winget publishing is pre-wired but commented out in
 
 Binaries on the GitHub Release work on every OS without any of this.
 
-## Before changing a host pack: record the last release
+## Recording a released host pack
+
+> **Normally automated.** The `record-pack` job (step 5 above) records each release's pack and
+> opens a PR right after the tag is cut — you just merge it. The manual command below is for when
+> you want to record a release by hand (the automation was skipped, or you are recording an older
+> tag as a one-off).
 
 `vichu init --host` and `vichu uninstall` decide whether a file is *ours* by comparing its
 bytes against the pack this binary ships **and every version we ever released**. That history
-lives in two places, and both must be updated **before** you change a pack file:
+lives in two places, and both must be updated for a release before its pack can be recognized:
 
 1. `internal/hostpacks/packs/<host>/known-hashes.json` — the sha256 of each file, per release.
    Compiled into the binary; the only reference a cloned repo cannot forge.
