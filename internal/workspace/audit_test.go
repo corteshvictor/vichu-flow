@@ -291,6 +291,12 @@ func TestIgnoredDirectoryIsNotEnumerated(t *testing.T) {
 // — a path that does not exist on disk. It therefore hashed to "", and a gate could
 // overwrite the real file with the diff seeing nothing change.
 func TestPorcelainPathsSurviveQuotingAndSpaces(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// One of the awkward names below contains '>' and ' -> ', which are invalid in a Windows
+		// filename — the case being exercised (git C-quotepath escaping of non-ASCII/awkward paths)
+		// is the same on every platform, so covering it on Unix is enough.
+		t.Skip("awkward filenames with '>' cannot exist on Windows")
+	}
 	dir := initRepo(t)
 	names := []string{"café.txt", "my notes.txt", "weird -> name.txt"}
 	for _, n := range names {
