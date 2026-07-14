@@ -4,11 +4,15 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"runtime"
+	"slices"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -157,6 +161,42 @@ type SecurityConfig struct {
 	// backstop for gates that mutate via an interpreter the policy can't
 	// introspect (e.g. `python -c '...'`).
 	GateMutations string `yaml:"gateMutations"`
+	// GateOutputs are the paths a gate is ALLOWED to rewrite — the coverage profile, the
+	// log, the report your test command legitimately produces. Globs, matched like a
+	// stage's scope. Empty by default: no path is disposable until you say so.
+	//
+	// It exists because the alternative is guessing, and the obvious guess is wrong. "The
+	// file is gitignored, so it must be build output" also describes a private note, a
+	// credential, a certificate, a local config, and anything a GLOBAL gitignore excludes
+	// that this project never mentioned. A gate that overwrites one of those has destroyed
+	// something irreplaceable. So the project declares which paths it is fine to lose.
+	//
+	// A sensitive path (`.env`, lockfiles, CI config) is never allowed, whatever is listed
+	// here. Only pre-existing files need allowlisting — a file the gate CREATES is always
+	// fine; it is not overwriting anything.
+	GateOutputs []string `yaml:"gateOutputs"`
+	// HostLocalState is what happens when the coding host's machine-local permission
+	// file changes during a worker (`.claude/settings.local.json`): warn (default) |
+	// block.
+	//
+	// This is a real, named limitation, not an oversight. In host-first mode VichuFlow
+	// does NOT launch the agent, so it cannot tell whether that file was written by the
+	// HOST (the user clicked "approve", which is normal and constant) or by the AGENT
+	// (granting itself tools, which is an escalation). The two are byte-identical on
+	// disk.
+	//
+	//   warn  — record it (mutations.json, flagged host_bookkeeping) and emit a loud
+	//           event, but do not block. Default, because blocking would kill a run every
+	//           time the user approves any command — the agent touched nothing.
+	//   block — block on any change. Correct when you have pre-authorized every command
+	//           your agents need, so the file should never move mid-run. This is the
+	//           setting to use if an agent escalating its own host permissions is in your
+	//           threat model.
+	//
+	// Either way the escalation cannot fool the KERNEL: it still runs your gates itself
+	// and still audits every file. What it buys an attacker is the host's approval
+	// prompt, not VichuFlow's verdict.
+	HostLocalState string `yaml:"hostLocalState"`
 }
 
 // Load reads and decodes vichu.yaml at path, then fills defaults for unset
@@ -166,12 +206,103 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	c, err := Parse(data)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return c, nil
+}
+
+// Parse decodes config YAML from bytes, applies defaults, and validates. It is the shared
+// core of Load and of loading a run's frozen config.snapshot.yaml through the confined Store
+// (which reads the bytes, so it cannot be redirected by a symlink) rather than by path.
+func Parse(data []byte) (*Config, error) {
 	var c Config
-	if err := yaml.Unmarshal(data, &c); err != nil {
-		return nil, fmt.Errorf("parsing %s: %w", path, err)
+	// KnownFields(true): an UNKNOWN key is a hard error, not silently ignored. A typo in a
+	// security or budget key (`hostLocalStates: block`, `maxAgentInvokations: 5`) otherwise
+	// leaves the real setting at its default while you believe you set it — a protection you
+	// think is on but is not. Every checked-in config and the generated template are within
+	// the schema, so this only ever rejects a genuine mistake.
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(&c); err != nil {
+		return nil, fmt.Errorf("parsing config: %w", err)
 	}
 	c.applyDefaults()
+	if err := c.Validate(); err != nil {
+		return nil, err
+	}
 	return &c, nil
+}
+
+// Validate rejects unknown values for the settings that gate behavior.
+//
+// Every one of these is checked elsewhere with `== "block"` or `!= "warn"`, which means a
+// TYPO FAILS OPEN: write `hostLocalState: bloock` and the option silently does nothing —
+// you believe you turned a protection on, and you did not. A security setting that can be
+// disabled by a misspelling is worse than no setting, because it buys false confidence.
+// So an unknown value is a hard error at load: `vichu doctor`, `run start` and `exec` all
+// go through here, and all of them stop before a run exists.
+func (c *Config) Validate() error {
+	for _, f := range []struct {
+		name  string
+		value string
+		allow []string
+	}{
+		{"security.sensitiveMutations", c.Security.SensitiveMutations, []string{"block", "warn"}},
+		{"security.outOfScopeMutations", c.Security.OutOfScopeMutations, []string{"block", "warn"}},
+		{"security.gateMutations", c.Security.GateMutations, []string{"block", "warn", "allow"}},
+		{"security.hostLocalState", c.Security.HostLocalState, []string{"block", "warn"}},
+		{"workspace.provider", c.Workspace.Provider, []string{"", WorkspaceAuto, WorkspaceGit, WorkspaceFilesystem}},
+		{"workspace.requireCleanTree", c.Workspace.RequireCleanTree, []string{"warn", "block", "allow"}},
+		{"workspace.isolation", c.Workspace.Isolation, []string{"current-worktree"}},
+		{"workflow.reviewContext", c.Workflow.ReviewContext, []string{"diff-only", "full"}},
+	} {
+		if !slices.Contains(f.allow, f.value) {
+			return fmt.Errorf("%s: unknown value %q (expected one of: %s)", f.name, f.value, strings.Join(f.allow, ", "))
+		}
+	}
+	return c.validateBudgets()
+}
+
+// validateBudgets rejects budgets that would DISABLE a limit by accident. A limit of 0 means
+// "no limit" by design, but a NEGATIVE value is never meaningful — and the engine only
+// enforces caps `> 0`, so `maxAgentInvocations: -1` silently turns the cap off. A cost that
+// is NaN or infinite compares false against every spend and disables the cost cap the same
+// way. Both are rejected so a budget you wrote is a budget that holds.
+func (c *Config) validateBudgets() error {
+	ints := []struct {
+		name string
+		v    int
+	}{
+		{"budgets.run.maxAgentInvocations", c.Budgets.Run.MaxAgentInvocations},
+		{"budgets.run.maxInputTokens", c.Budgets.Run.MaxInputTokens},
+		{"budgets.run.maxOutputTokens", c.Budgets.Run.MaxOutputTokens},
+		{"budgets.run.maxTotalTokens", c.Budgets.Run.MaxTotalTokens},
+		{"budgets.context.maxContextPackKB", c.Budgets.Context.MaxContextPackKB},
+		{"budgets.context.maxLogExcerptKB", c.Budgets.Context.MaxLogExcerptKB},
+		// The review auto-fix cap is enforced only when > 0, so a negative value silently
+		// turns off the loop bound — a review that always says needs_fixes runs until some
+		// OTHER backstop (tokens, invocations) trips. It belongs with the budgets above.
+		{"workflow.maxAutoIterations", c.Workflow.MaxAutoIterations},
+	}
+	for _, f := range ints {
+		if f.v < 0 {
+			return fmt.Errorf("%s: %d is negative (0 means no limit; a negative value would disable the cap)", f.name, f.v)
+		}
+	}
+	if c.Budgets.Run.MaxWallClock < 0 {
+		return fmt.Errorf("budgets.run.maxWallClock: %s is negative", time.Duration(c.Budgets.Run.MaxWallClock))
+	}
+	if cost := c.Budgets.Run.MaxCostUSD; math.IsNaN(cost) || math.IsInf(cost, 0) || cost < 0 {
+		return fmt.Errorf("budgets.run.maxCostUSD: %v is not a usable limit (must be a finite, non-negative number; 0 means no limit)", cost)
+	}
+	for name, sb := range c.Budgets.Stage {
+		if sb.MaxIterations < 0 || sb.MaxTotalTokens < 0 || sb.MaxInputTokens < 0 || sb.MaxOutputTokens < 0 || sb.MaxWallClock < 0 {
+			return fmt.Errorf("budgets.stage.%s: has a negative limit (0 means no limit; a negative value would disable the cap)", name)
+		}
+	}
+	return nil
 }
 
 // Exists reports whether a config file exists at path.
@@ -180,14 +311,20 @@ func Exists(path string) bool {
 	return err == nil
 }
 
-// Save writes the config as YAML to path.
+// Save writes the config as YAML to path. This is the human-driven `vichu init`/`config`
+// path, operating on the repo root before any agent runs. The RUN's frozen snapshot goes
+// through the confined Store instead (Store.SaveConfigSnapshot) — see MarshalYAML.
 func (c *Config) Save(path string) error {
-	data, err := yaml.Marshal(c)
+	data, err := c.MarshalYAML()
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(path, data, 0o644)
 }
+
+// MarshalYAML serializes the config to YAML bytes, so a caller can persist it through a
+// confined writer rather than a raw os.WriteFile.
+func (c *Config) MarshalYAML() ([]byte, error) { return yaml.Marshal(c) }
 
 // Default returns a config populated with v0.1 defaults.
 func Default() *Config {
@@ -216,6 +353,7 @@ func (c *Config) applyDefaults() {
 	defaultStr(&c.Security.SensitiveMutations, "block")
 	defaultStr(&c.Security.OutOfScopeMutations, "warn")
 	defaultStr(&c.Security.GateMutations, "block")
+	defaultStr(&c.Security.HostLocalState, "warn")
 	if c.Security.RequireConfirmationFor == nil {
 		c.Security.RequireConfirmationFor = []string{"git_push", "destructive_shell", "package_install"}
 	}

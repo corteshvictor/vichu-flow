@@ -5,12 +5,30 @@ import (
 	"strings"
 )
 
+// DefaultOptions are the inputs to DefaultYAML. It is a struct, not a positional list, so a
+// new knob (like WorkspaceProvider was) does not silently shift the meaning of an argument at
+// every call site.
+type DefaultOptions struct {
+	Detected    Detected
+	ProjectName string
+	// WorkspaceProvider is the workspace.provider value to write (auto|git|filesystem). Empty
+	// normalizes to auto. It exists because `vichu init --provider filesystem` used to open
+	// the workspace with that provider but still write `provider: auto`, so the choice was
+	// silently dropped and the next run resolved the provider afresh.
+	WorkspaceProvider string
+}
+
 // DefaultYAML renders a commented vichu.yaml for `vichu init`, seeded with the
 // detected stack. Comments are preserved by writing a template (not marshaling).
-func DefaultYAML(d Detected, projectName string) string {
+func DefaultYAML(o DefaultOptions) string {
+	d := o.Detected
 	lang := d.Language
 	if lang == "" {
 		lang = "auto"
+	}
+	workspaceProvider := o.WorkspaceProvider
+	if workspaceProvider == "" {
+		workspaceProvider = WorkspaceAuto
 	}
 	cmd := func(v string) string {
 		if v == "" {
@@ -46,7 +64,7 @@ workflow:
   requireGates: true       # block (don't "complete") if no verify gates are configured; set false for demo/fake
 
 workspace:
-  provider: auto                # auto | git | filesystem — git when the folder is a repo, else snapshot under .vichu/
+  provider: %s                # auto | git | filesystem — git when the folder is a repo, else snapshot under .vichu/
   isolation: current-worktree   # agents write to the current worktree
   requireCleanTree: warn        # warn | block | allow
 
@@ -95,7 +113,15 @@ security:
   allowNetwork: true            # RESERVED — not yet enforced (no portable network isolation)
   sensitiveMutations: block     # block | warn — worker touches CI/VCS/config/lockfiles
   outOfScopeMutations: warn     # warn | block — worker touches files outside stage scope
-  gateMutations: block          # block | warn | allow — a gate changes/deletes an existing tracked or pre-existing untracked file (rolled back on block)
+  gateMutations: block          # block | warn | allow — a gate changes/deletes a file that ALREADY EXISTED (rolled back on block)
+  gateOutputs: []               # paths a gate MAY rewrite (globs), e.g. [coverage.out]. Empty = none.
+                                #   Being gitignored is not enough: an ignored file can be a private
+                                #   note or a credential. Declare what your gate is meant to write.
+                                #   A sensitive path (.env, lockfiles, CI config) is never allowed.
+  hostLocalState: warn          # warn | block — the coding host's own permission file
+                                #   (.claude/settings.local.json) changed mid-run. Default warn:
+                                #   the host rewrites it on every approval. Set block if you have
+                                #   pre-authorized what your agents need (see docs; hooks can run code).
   requireConfirmationFor:
     - git_push
     - destructive_shell
@@ -103,6 +129,6 @@ security:
 
 # Extra project conventions to inject into every worker's context pack.
 conventions: []
-`, projectName, lang, testBlock, cmd(d.LintCmd), cmd(d.TypecheckCmd))
+`, o.ProjectName, lang, workspaceProvider, testBlock, cmd(d.LintCmd), cmd(d.TypecheckCmd))
 	return b.String()
 }

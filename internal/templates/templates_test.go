@@ -36,7 +36,7 @@ func TestEveryTemplateYieldsRunnableConfig(t *testing.T) {
 		}
 		dir := t.TempDir()
 		cfgPath := filepath.Join(dir, config.FileName)
-		if err := os.WriteFile(cfgPath, []byte(config.DefaultYAML(tpl.Detected, "demo")), 0o644); err != nil {
+		if err := os.WriteFile(cfgPath, []byte(config.DefaultYAML(config.DefaultOptions{Detected: tpl.Detected, ProjectName: "demo"})), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		cfg, err := config.Load(cfgPath)
@@ -78,7 +78,7 @@ func TestEmptyTemplateGateIsCrossPlatform(t *testing.T) {
 	tpl, _ := Get("empty")
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, config.FileName)
-	if err := os.WriteFile(cfgPath, []byte(config.DefaultYAML(tpl.Detected, "demo")), 0o644); err != nil {
+	if err := os.WriteFile(cfgPath, []byte(config.DefaultYAML(config.DefaultOptions{Detected: tpl.Detected, ProjectName: "demo"})), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := config.Load(cfgPath)

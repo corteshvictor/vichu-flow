@@ -64,7 +64,7 @@ const fixInstruction = "Address the reviewer's findings from the previous review
 const reviewInstruction = "Review the implementation against the task. Investigate as needed, then END your " +
 	"reply with a single JSON object on its own line and NOTHING after it:\n" +
 	"{\"status\": \"approved\" | \"needs_fixes\" | \"blocked\", \"summary\": \"<one line>\", " +
-	"\"findings\": [{\"severity\": \"blocker\" | \"major\" | \"minor\", \"file\": \"<path>\", \"message\": \"<what to fix>\"}]}\n" +
+	"\"findings\": [{\"severity\": \"blocker\" | \"major\" | \"minor\", \"file\": \"<path>\", \"message\": \"<observation>\"}]}\n" +
 	"Use \"approved\" if it is correct and complete; \"needs_fixes\" (with findings) if there are " +
 	"defects to address; \"blocked\" if the task cannot be done safely or is underspecified."
 
