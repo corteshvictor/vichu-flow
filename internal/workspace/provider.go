@@ -25,8 +25,10 @@ type Provider interface {
 	BeginTracking() (*Tracker, error)
 	// ResumeTracking reconstructs a Tracker from a before-snapshot produced by
 	// Tracker.Before, so a host-first `worker complete` can diff against what a
-	// separate `worker start` process captured.
-	ResumeTracking(before map[string]core.FileSig) *Tracker
+	// separate `worker start` process captured. It fails on a snapshot whose recorded
+	// state is ambiguous — an older one that cannot say whether a file was absent or
+	// merely unreadable — rather than guess between two opposite outcomes.
+	ResumeTracking(before map[string]core.FileSig) (*Tracker, error)
 	// BackupChanged captures the content of every currently-changed file, so a
 	// blocking gate's damage to pre-existing work can be rolled back.
 	BackupChanged() (*Backup, error)

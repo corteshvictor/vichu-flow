@@ -177,7 +177,15 @@ func TestBackupRestorePreservesMode(t *testing.T) {
 		t.Fatalf("BackupChanged: %v", err)
 	}
 	// A gate clobbers it with different content and loses the exec bit.
+	//
+	// The Chmod is the point. os.WriteFile does NOT change the mode of a file that already
+	// exists, so passing 0o644 here changes nothing — which is why this test used to pass
+	// against a restore that never restored a mode at all. The gate has to actually chmod
+	// it for the assertion below to mean anything.
 	if err := os.WriteFile(script, []byte("damaged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(script, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := backup.Restore(); err != nil {
@@ -189,6 +197,86 @@ func TestBackupRestorePreservesMode(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o755 {
 		t.Fatalf("restore must preserve mode 0755, got %o", info.Mode().Perm())
+	}
+}
+
+// TestRollbackRestoresANarrowedMode is the security half of the mode story: a gate that
+// WIDENS a private file (0600 → 0644) while editing it has exposed it, and the rollback
+// must take that back. It did not — os.WriteFile leaves an existing file's mode alone, so
+// the content was reverted and the file stayed world-readable.
+func TestRollbackRestoresANarrowedMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix file modes not meaningful on windows")
+	}
+	w, dir := fsWorkspace(t)
+	if _, err := w.Snapshot(""); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(dir, "id_rsa")
+	if err := os.WriteFile(secret, []byte("PRIVATE KEY\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(secret, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := w.BackupChanged()
+	if err != nil {
+		t.Fatalf("BackupChanged: %v", err)
+	}
+
+	// The gate widens it and rewrites it.
+	if err := os.WriteFile(secret, []byte("tampered\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(secret, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backup.Restore(); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	info, err := os.Stat(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("the rollback left the file world-readable: mode %o, want 0600", info.Mode().Perm())
+	}
+	if data, rerr := os.ReadFile(secret); rerr != nil || string(data) != "PRIVATE KEY\n" {
+		t.Fatalf("content: %q (%v)", data, rerr)
+	}
+}
+
+// TestModeChangeAloneIsAMutation: a gate that chmods without touching a byte has still
+// changed the tree, and the audit has to say so. Comparing hashes alone missed it.
+func TestModeChangeAloneIsAMutation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix file modes not meaningful on windows")
+	}
+	w, dir := fsWorkspace(t)
+	if _, err := w.Snapshot(""); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(dir, "id_rsa")
+	if err := os.WriteFile(secret, []byte("PRIVATE KEY\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(secret, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tracker, err := w.BeginTracking()
+	if err != nil {
+		t.Fatalf("BeginTracking: %v", err)
+	}
+	if err := os.Chmod(secret, 0o644); err != nil { // content untouched
+		t.Fatal(err)
+	}
+	muts, err := tracker.Finish()
+	if err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	if len(muts) != 1 || muts[0].Path != "id_rsa" {
+		t.Fatalf("widening 0600 to 0644 is a mutation; the audit reported %+v", muts)
 	}
 }
 
@@ -216,4 +304,38 @@ func readFile(t *testing.T, dir, name string) string {
 		t.Fatal(err)
 	}
 	return string(data)
+}
+
+// TestRestoreBaselineFailsLoudlyOnAnUnreadableCopy: an unreadable baseline copy must NOT be
+// silently treated as "a file the run added". That was the canonical bug — an os.ReadFile
+// error collapsed into a benign meaning — and here it made rollbackGate report
+// gate_rolled_back while the user's file stayed destroyed.
+func TestRestoreBaselineFailsLoudlyOnAnUnreadableCopy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX modes; the Windows equivalent is a denied ACL")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root reads everything")
+	}
+	w, dir := fsWorkspace(t)
+	writeFile(t, dir, "app.go", "v1\n")
+	if _, err := w.Snapshot(""); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, dir, "app.go", "CORRUPT\n")
+
+	// The baseline copy exists but becomes unreadable after the snapshot.
+	baseCopy := filepath.Join(dir, ".vichu", "baseline", "app.go")
+	if err := os.Chmod(baseCopy, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(baseCopy, 0o644) })
+
+	n, err := w.RestoreBaseline([]string{"app.go"})
+	if err == nil {
+		t.Fatal("an unreadable baseline copy must fail loudly, not be skipped as 'run added'")
+	}
+	if n != 0 {
+		t.Fatalf("nothing was restored, but the count says %d", n)
+	}
 }

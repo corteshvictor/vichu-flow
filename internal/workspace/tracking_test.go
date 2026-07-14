@@ -41,7 +41,11 @@ func TestTrackingSurvivesProcessBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	muts, err := w2.ResumeTracking(before).Finish()
+	resumed, err := w2.ResumeTracking(before)
+	if err != nil {
+		t.Fatalf("ResumeTracking: %v", err)
+	}
+	muts, err := resumed.Finish()
 	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
