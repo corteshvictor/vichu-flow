@@ -105,7 +105,7 @@ func TestReviewLoopFixesThenApproves(t *testing.T) {
 // once the auto-fix budget is spent — it never silently gives up or completes.
 func TestReviewExhaustsAutoFixBudget(t *testing.T) {
 	dir := newTestRepo(t)
-	e, _ := reviewEngine(t, dir, []adapters.FakeVerdict{{Status: "needs_fixes", Summary: "still wrong"}})
+	e, _ := reviewEngine(t, dir, []adapters.FakeVerdict{{Status: "needs_fixes", Summary: "still wrong", Findings: []core.Finding{{Severity: "major", Message: "fix it"}}}})
 
 	state, err := e.Start(context.Background(), "add a feature", "review")
 	if err != nil {
@@ -138,7 +138,7 @@ func TestReviewPerStageBudgetOverridesDefault(t *testing.T) {
 		Actions: map[string][]adapters.FakeAction{
 			"implementer": {{Type: "write_file", Path: "src/feature.txt", Content: "feature\n"}},
 		},
-		Verdicts: map[string][]adapters.FakeVerdict{"reviewer": {{Status: "needs_fixes", Summary: "nope"}}},
+		Verdicts: map[string][]adapters.FakeVerdict{"reviewer": {{Status: "needs_fixes", Summary: "nope", Findings: []core.Finding{{Severity: "major", Message: "fix it"}}}}},
 	}
 	reg := adapters.NewRegistry()
 	reg.Register(adapters.FakeName, func() (adapters.Adapter, error) { return adapters.NewFake(script), nil })
@@ -180,7 +180,7 @@ func TestReviewStageTokenBudgetStopsLoop(t *testing.T) {
 		Actions: map[string][]adapters.FakeAction{
 			"implementer": {{Type: "write_file", Path: "src/feature.txt", Content: "feature\n"}},
 		},
-		Verdicts: map[string][]adapters.FakeVerdict{"reviewer": {{Status: "needs_fixes", Summary: "again"}}},
+		Verdicts: map[string][]adapters.FakeVerdict{"reviewer": {{Status: "needs_fixes", Summary: "again", Findings: []core.Finding{{Severity: "major", Message: "fix it"}}}}},
 	}
 	reg := adapters.NewRegistry()
 	reg.Register(adapters.FakeName, func() (adapters.Adapter, error) { return adapters.NewFake(script), nil })
@@ -374,6 +374,103 @@ func TestReviewContextTruncationIsRecorded(t *testing.T) {
 	events, _ := store.ReadEvents(state.RunID)
 	if !hasEvent(events, core.EventReviewContextTruncated) {
 		t.Fatalf("review-context truncation must be recorded (status %s)", state.Status)
+	}
+}
+
+// TestReviewChangesetNeverFollowsSymlinkToExternalFile: the diff-only change set is built from
+// the files the run changed. If an agent turns a changed file into a SYMLINK pointing OUTSIDE
+// the project, the reviewer prompt must not carry the target's bytes — otherwise the run
+// silently exfiltrates a host secret (say ~/.ssh/id_rsa) to a remote reviewer (Codex/Claude).
+// The link is shown AS a link; the external content is never read.
+func TestReviewChangesetNeverFollowsSymlinkToExternalFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation needs elevated privileges on Windows")
+	}
+	dir := newTestRepo(t)
+
+	const canary = "TOPSECRET-EXFIL-CANARY"
+	secret := filepath.Join(t.TempDir(), "outside-secret.txt")
+	if err := os.WriteFile(secret, []byte(canary), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(dir, "leaked.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	store := rt.Open(dir)
+	state := &core.State{RunID: "run-leak", Status: core.StatusActive, Stages: map[string]core.StageStatus{}, Iterations: map[string]int{}}
+	if err := store.CreateRun(state); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveMutationReport("run-leak", "implement-01", &core.MutationReport{
+		Worker: "implement-01", Stage: "implement",
+		Mutations: []core.Mutation{{Path: "leaked.txt", Kind: core.MutationAdded}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cs, _, _, err := testEngine(t, dir).reviewChangeset(state)
+	if err != nil {
+		t.Fatalf("a symlinked change must be represented, not error: %v", err)
+	}
+	if strings.Contains(cs, canary) {
+		t.Fatalf("the review change set LEAKED an external file's contents:\n%s", cs)
+	}
+	if !strings.Contains(cs, "leaked.txt") || !strings.Contains(cs, "symlink") {
+		t.Fatalf("a symlinked change should be shown as a symlink, got:\n%s", cs)
+	}
+}
+
+// TestReviewChangesetBlocksOnCorruptMutationReport: the change set is built from the workers'
+// mutation reports. If one is corrupt, DROPPING it (the old behavior) hid that worker's changes
+// from the reviewer, who then approved a diff it never saw. A report we cannot read must block.
+func TestReviewChangesetBlocksOnCorruptMutationReport(t *testing.T) {
+	dir := newTestRepo(t)
+	store := rt.Open(dir)
+	state := &core.State{RunID: "run-corrupt", Status: core.StatusActive, Stages: map[string]core.StageStatus{}, Iterations: map[string]int{}}
+	if err := store.CreateRun(state); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveMutationReport("run-corrupt", "implement-01", &core.MutationReport{
+		Worker: "implement-01", Stage: "implement",
+		Mutations: []core.Mutation{{Path: "feature.txt", Kind: core.MutationAdded}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Corrupt the report on disk (an agent that can write .vichu, or a bad disk).
+	mp := filepath.Join(store.WorkerDir("run-corrupt", "implement-01"), "mutations.json")
+	if err := os.WriteFile(mp, []byte("{not-json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, _, err := testEngine(t, dir).reviewChangeset(state); err == nil {
+		t.Fatal("reviewChangeset must error on a corrupt mutation report, not treat it as an empty change set")
+	}
+}
+
+// TestReviewChangesetBlocksOnMissingMutationReport: an ABSENT report is as dangerous as a corrupt
+// one — every worker that ran wrote one (even empty), so a missing one was deleted to hide the
+// worker's changes from the reviewer. It must block, not be skipped as "no changes".
+func TestReviewChangesetBlocksOnMissingMutationReport(t *testing.T) {
+	dir := newTestRepo(t)
+	store := rt.Open(dir)
+	state := &core.State{RunID: "run-missing", Status: core.StatusActive, Stages: map[string]core.StageStatus{}, Iterations: map[string]int{}}
+	if err := store.CreateRun(state); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveMutationReport("run-missing", "implement-02", &core.MutationReport{
+		Worker: "implement-02", Stage: "implement",
+		Mutations: []core.Mutation{{Path: "feature.txt", Kind: core.MutationAdded}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The worker ran (its dir exists) but its report is deleted.
+	if err := os.Remove(filepath.Join(store.WorkerDir("run-missing", "implement-02"), "mutations.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, _, err := testEngine(t, dir).reviewChangeset(state); err == nil {
+		t.Fatal("reviewChangeset must error on a missing mutation report for a worker that ran, not treat it as no changes")
 	}
 }
 

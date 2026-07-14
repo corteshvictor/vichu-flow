@@ -51,7 +51,21 @@ func (s *Store) statePath(runID string) string { return filepath.Join(s.RunDir(r
 func (s *Store) eventsPath(runID string) string {
 	return filepath.Join(s.RunDir(runID), "events.ndjson")
 }
-func (s *Store) lockPath(runID string) string { return filepath.Join(s.RunDir(runID), "lock.json") }
+
+// HostPackScope is the reserved lock scope for host-pack install/uninstall. It is not a
+// run id — those are timestamped (`run-…`) — so it can never collide with one. The lock is
+// PROJECT-wide, not per-run, because two `vichu init --host` processes edit the same
+// `.claude/settings.json`: without it they read the same allow-list, each append their
+// rules, and the last write wins, silently dropping the other's.
+const HostPackScope = "hostpack"
+
+// lockPath is the lock file for a scope: a run, or the project-wide host-pack scope.
+func (s *Store) lockPath(scope string) string {
+	if scope == HostPackScope {
+		return filepath.Join(s.root, "hostpack.lock.json")
+	}
+	return filepath.Join(s.RunDir(scope), "lock.json")
+}
 
 func (s *Store) workspacePath(runID string) string {
 	return filepath.Join(s.RunDir(runID), "workspace.json")
@@ -92,9 +106,15 @@ func (s *Store) ArtifactsDir(runID string) string {
 	return filepath.Join(s.RunDir(runID), "artifacts")
 }
 
-// NewRunID builds a sortable, unique run id of the form run-YYYYMMDD-HHMMSS-xxxx.
+// NewRunID builds a sortable, unique run id of the form run-YYYYMMDD-HHMMSS-xxxxxxxxxxxx.
+//
+// The random suffix is 6 bytes (48 bits), not 2. Two run starts in the same wall-clock
+// second collide with birthday probability over the suffix space, and a 16-bit suffix put
+// that at ~50% around 300 concurrent starts/second — at which point CreateRun silently
+// overwrote the first run's state. 48 bits makes it negligible; CreateRun also now refuses
+// an id that already exists, so a collision fails loudly instead of clobbering.
 func NewRunID(now time.Time) string {
-	return fmt.Sprintf("run-%s-%s", now.UTC().Format("20060102-150405"), randSuffix(2))
+	return fmt.Sprintf("run-%s-%s", now.UTC().Format("20060102-150405"), randSuffix(6))
 }
 
 func randSuffix(n int) string {

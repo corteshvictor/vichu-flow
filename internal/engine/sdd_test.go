@@ -45,35 +45,35 @@ func TestSDDWorkflowRegistered(t *testing.T) {
 // under artifacts/ via the kernel (single-writer).
 func TestSDDArtifactDefaultAndExplicit(t *testing.T) {
 	e, store, _ := hostFirstEngine(t)
-	state, err := e.StartRun("build a thing", "sdd", "")
+	state, tok, err := e.StartRun("build a thing", "sdd", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	runID := state.RunID
 
 	// explore → propose. The propose result becomes the default `proposal` artifact.
-	mustWorker(t, e, runID, "explore", "explorer", "", "")
-	mustStageClose(t, e, runID, "explore")
+	mustWorker(t, e, hostRun{runID, tok}, "explore", "explorer", "", "")
+	mustStageClose(t, e, hostRun{runID, tok}, "explore")
 
-	wid, _, err := e.WorkerStart(runID, "propose", "proposer", "")
+	wid, _, err := e.WorkerStart(runID, "propose", "proposer", "", tok)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.WorkerComplete(runID, wid, "", WorkerOutcome{Result: "## Proposal\nDo X because Y."}); err != nil {
+	if _, err := e.WorkerComplete(runID, wid, "", tok, WorkerOutcome{Result: "## Proposal\nDo X because Y."}); err != nil {
 		t.Fatal(err)
 	}
 	proposal := filepath.Join(store.ArtifactsDir(runID), "proposal.md")
 	if data, err := os.ReadFile(proposal); err != nil || len(data) == 0 {
 		t.Fatalf("propose result must become the default proposal artifact: %v", err)
 	}
-	mustStageClose(t, e, runID, "propose")
+	mustStageClose(t, e, hostRun{runID, tok}, "propose")
 
 	// plan → pass an EXPLICIT plan artifact.
-	wid2, _, err := e.WorkerStart(runID, "plan", "planner", "")
+	wid2, _, err := e.WorkerStart(runID, "plan", "planner", "", tok)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.WorkerComplete(runID, wid2, "", WorkerOutcome{Result: "result", Artifacts: map[string]string{"plan": "1. step one\n2. step two\n## Tests\n- test add"}}); err != nil {
+	if _, err := e.WorkerComplete(runID, wid2, "", tok, WorkerOutcome{Result: "result", Artifacts: map[string]string{"plan": "1. step one\n2. step two\n## Tests\n- test add"}}); err != nil {
 		t.Fatal(err)
 	}
 	planFile := filepath.Join(store.ArtifactsDir(runID), "plan.md")
@@ -91,25 +91,25 @@ func TestSDDArtifactDefaultAndExplicit(t *testing.T) {
 // closing it blocks unless the plan artifact declares a `## Tests` section.
 func TestSDDPlanRequiresTestsSection(t *testing.T) {
 	e, _, _ := hostFirstEngine(t)
-	state, err := e.StartRun("build a thing", "sdd", "")
+	state, tok, err := e.StartRun("build a thing", "sdd", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	runID := state.RunID
-	mustWorker(t, e, runID, "explore", "explorer", "", "")
-	mustStageClose(t, e, runID, "explore")
-	wid, _, _ := e.WorkerStart(runID, "propose", "proposer", "")
-	if _, err := e.WorkerComplete(runID, wid, "", WorkerOutcome{Result: "## Proposal"}); err != nil {
+	mustWorker(t, e, hostRun{runID, tok}, "explore", "explorer", "", "")
+	mustStageClose(t, e, hostRun{runID, tok}, "explore")
+	wid, _, _ := e.WorkerStart(runID, "propose", "proposer", "", tok)
+	if _, err := e.WorkerComplete(runID, wid, "", tok, WorkerOutcome{Result: "## Proposal"}); err != nil {
 		t.Fatal(err)
 	}
-	mustStageClose(t, e, runID, "propose")
+	mustStageClose(t, e, hostRun{runID, tok}, "propose")
 
 	// A plan WITHOUT a Tests section → stage close blocks.
-	wid2, _, _ := e.WorkerStart(runID, "plan", "planner", "")
-	if _, err := e.WorkerComplete(runID, wid2, "", WorkerOutcome{Result: "1. do the thing"}); err != nil {
+	wid2, _, _ := e.WorkerStart(runID, "plan", "planner", "", tok)
+	if _, err := e.WorkerComplete(runID, wid2, "", tok, WorkerOutcome{Result: "1. do the thing"}); err != nil {
 		t.Fatal(err)
 	}
-	reason, err := e.StageClose(runID, "plan", "")
+	reason, err := e.StageClose(runID, "plan", "", tok)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,23 +123,23 @@ func TestSDDPlanRequiresTestsSection(t *testing.T) {
 // `stage close` — the proposal is a contract, not just a prompt.
 func TestSDDProposeBlocksOnMissingProposalHostFirst(t *testing.T) {
 	e, store, _ := hostFirstEngine(t)
-	state, err := e.StartRun("build a thing", "sdd", "")
+	state, tok, err := e.StartRun("build a thing", "sdd", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	runID := state.RunID
-	mustWorker(t, e, runID, "explore", "explorer", "", "")
-	mustStageClose(t, e, runID, "explore")
+	mustWorker(t, e, hostRun{runID, tok}, "explore", "explorer", "", "")
+	mustStageClose(t, e, hostRun{runID, tok}, "explore")
 
 	// propose with an EMPTY result and no artifact → nothing materialized.
-	wid, _, _ := e.WorkerStart(runID, "propose", "proposer", "")
-	if _, err := e.WorkerComplete(runID, wid, "", WorkerOutcome{Result: ""}); err != nil {
+	wid, _, _ := e.WorkerStart(runID, "propose", "proposer", "", tok)
+	if _, err := e.WorkerComplete(runID, wid, "", tok, WorkerOutcome{Result: ""}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(store.ArtifactsDir(runID), "proposal.md")); err == nil {
 		t.Fatal("an empty propose result must not materialize a proposal artifact")
 	}
-	reason, err := e.StageClose(runID, "propose", "")
+	reason, err := e.StageClose(runID, "propose", "", tok)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,16 +152,16 @@ func TestSDDProposeBlocksOnMissingProposalHostFirst(t *testing.T) {
 // artifact is no evidence — `stage close` must reject a whitespace-only proposal.
 func TestSDDProposeBlocksOnEmptyArtifactHostFirst(t *testing.T) {
 	e, store, _ := hostFirstEngine(t)
-	state, err := e.StartRun("build a thing", "sdd", "")
+	state, tok, err := e.StartRun("build a thing", "sdd", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	runID := state.RunID
-	mustWorker(t, e, runID, "explore", "explorer", "", "")
-	mustStageClose(t, e, runID, "explore")
+	mustWorker(t, e, hostRun{runID, tok}, "explore", "explorer", "", "")
+	mustStageClose(t, e, hostRun{runID, tok}, "explore")
 
-	wid, _, _ := e.WorkerStart(runID, "propose", "proposer", "")
-	if _, err := e.WorkerComplete(runID, wid, "", WorkerOutcome{
+	wid, _, _ := e.WorkerStart(runID, "propose", "proposer", "", tok)
+	if _, err := e.WorkerComplete(runID, wid, "", tok, WorkerOutcome{
 		Result: "x", Artifacts: map[string]string{"proposal": "   \n  "},
 	}); err != nil {
 		t.Fatal(err)
@@ -170,7 +170,7 @@ func TestSDDProposeBlocksOnEmptyArtifactHostFirst(t *testing.T) {
 	if data, _ := os.ReadFile(filepath.Join(store.ArtifactsDir(runID), "proposal.md")); strings.TrimSpace(string(data)) != "" {
 		t.Fatal("precondition: the proposal artifact should be blank")
 	}
-	reason, err := e.StageClose(runID, "propose", "")
+	reason, err := e.StageClose(runID, "propose", "", tok)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,17 +184,17 @@ func TestSDDProposeBlocksOnEmptyArtifactHostFirst(t *testing.T) {
 // can't be smuggled in from another stage (the exact reported bug).
 func TestSDDProposeCannotProducePlanArtifact(t *testing.T) {
 	e, store, _ := hostFirstEngine(t)
-	state, err := e.StartRun("build a thing", "sdd", "")
+	state, tok, err := e.StartRun("build a thing", "sdd", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	runID := state.RunID
-	mustWorker(t, e, runID, "explore", "explorer", "", "")
-	mustStageClose(t, e, runID, "explore")
+	mustWorker(t, e, hostRun{runID, tok}, "explore", "explorer", "", "")
+	mustStageClose(t, e, hostRun{runID, tok}, "explore")
 
-	wid, _, _ := e.WorkerStart(runID, "propose", "proposer", "")
+	wid, _, _ := e.WorkerStart(runID, "propose", "proposer", "", tok)
 	// propose tries to slip in a `plan` artifact — must error, write nothing.
-	if _, err := e.WorkerComplete(runID, wid, "", WorkerOutcome{
+	if _, err := e.WorkerComplete(runID, wid, "", tok, WorkerOutcome{
 		Result: "## Proposal", Artifacts: map[string]string{"plan": "1. step\n## Tests\n- t"},
 	}); err == nil {
 		t.Fatal("propose must not be allowed to produce a `plan` artifact")
@@ -209,22 +209,22 @@ func TestSDDProposeCannotProducePlanArtifact(t *testing.T) {
 // attributes it to a different stage — the evidence must be plan's own.
 func TestSDDPlanRejectsForeignProvenance(t *testing.T) {
 	e, store, _ := hostFirstEngine(t)
-	state, err := e.StartRun("build a thing", "sdd", "")
+	state, tok, err := e.StartRun("build a thing", "sdd", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	runID := state.RunID
-	mustWorker(t, e, runID, "explore", "explorer", "", "")
-	mustStageClose(t, e, runID, "explore")
-	wid, _, _ := e.WorkerStart(runID, "propose", "proposer", "")
-	if _, err := e.WorkerComplete(runID, wid, "", WorkerOutcome{Result: "## Proposal\nX"}); err != nil {
+	mustWorker(t, e, hostRun{runID, tok}, "explore", "explorer", "", "")
+	mustStageClose(t, e, hostRun{runID, tok}, "explore")
+	wid, _, _ := e.WorkerStart(runID, "propose", "proposer", "", tok)
+	if _, err := e.WorkerComplete(runID, wid, "", tok, WorkerOutcome{Result: "## Proposal\nX"}); err != nil {
 		t.Fatal(err)
 	}
-	mustStageClose(t, e, runID, "propose")
+	mustStageClose(t, e, hostRun{runID, tok}, "propose")
 
 	// plan produces a valid plan (with the Tests section).
-	wid2, _, _ := e.WorkerStart(runID, "plan", "planner", "")
-	if _, err := e.WorkerComplete(runID, wid2, "", WorkerOutcome{Result: "## Plan\n## Tests\n- t"}); err != nil {
+	wid2, _, _ := e.WorkerStart(runID, "plan", "planner", "", tok)
+	if _, err := e.WorkerComplete(runID, wid2, "", tok, WorkerOutcome{Result: "## Plan\n## Tests\n- t"}); err != nil {
 		t.Fatal(err)
 	}
 	// Tamper the provenance: claim the plan came from `propose`, not `plan`.
@@ -236,7 +236,7 @@ func TestSDDPlanRejectsForeignProvenance(t *testing.T) {
 	if err := store.SaveArtifactMeta(runID, "plan", meta); err != nil {
 		t.Fatal(err)
 	}
-	reason, err := e.StageClose(runID, "plan", "")
+	reason, err := e.StageClose(runID, "plan", "", tok)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,21 +251,21 @@ func TestSDDPlanRejectsForeignProvenance(t *testing.T) {
 // exactly what the worker produced.
 func TestSDDPlanRejectsTamperedArtifactContent(t *testing.T) {
 	e, store, _ := hostFirstEngine(t)
-	state, err := e.StartRun("build a thing", "sdd", "")
+	state, tok, err := e.StartRun("build a thing", "sdd", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	runID := state.RunID
-	mustWorker(t, e, runID, "explore", "explorer", "", "")
-	mustStageClose(t, e, runID, "explore")
-	wid, _, _ := e.WorkerStart(runID, "propose", "proposer", "")
-	if _, err := e.WorkerComplete(runID, wid, "", WorkerOutcome{Result: "## Proposal\nX"}); err != nil {
+	mustWorker(t, e, hostRun{runID, tok}, "explore", "explorer", "", "")
+	mustStageClose(t, e, hostRun{runID, tok}, "explore")
+	wid, _, _ := e.WorkerStart(runID, "propose", "proposer", "", tok)
+	if _, err := e.WorkerComplete(runID, wid, "", tok, WorkerOutcome{Result: "## Proposal\nX"}); err != nil {
 		t.Fatal(err)
 	}
-	mustStageClose(t, e, runID, "propose")
+	mustStageClose(t, e, hostRun{runID, tok}, "propose")
 
-	wid2, _, _ := e.WorkerStart(runID, "plan", "planner", "")
-	if _, err := e.WorkerComplete(runID, wid2, "", WorkerOutcome{Result: "## Plan\n## Tests\n- t"}); err != nil {
+	wid2, _, _ := e.WorkerStart(runID, "plan", "planner", "", tok)
+	if _, err := e.WorkerComplete(runID, wid2, "", tok, WorkerOutcome{Result: "## Plan\n## Tests\n- t"}); err != nil {
 		t.Fatal(err)
 	}
 	// Tamper the artifact CONTENT on disk, leaving its provenance metadata intact.
@@ -273,7 +273,7 @@ func TestSDDPlanRejectsTamperedArtifactContent(t *testing.T) {
 	if err := os.WriteFile(planFile, []byte("## Plan\n## Tests\n- injected after the fact"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	reason, err := e.StageClose(runID, "plan", "")
+	reason, err := e.StageClose(runID, "plan", "", tok)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,20 +407,20 @@ func TestSDDHeadlessBlocksOnEmptyProposal(t *testing.T) {
 // host can never write an arbitrary path or filename.
 func TestArtifactNameMustBeAllowlisted(t *testing.T) {
 	e, _, _ := hostFirstEngine(t)
-	state, err := e.StartRun("x", "sdd", "")
+	state, tok, err := e.StartRun("x", "sdd", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	runID := state.RunID
-	mustWorker(t, e, runID, "explore", "explorer", "", "")
-	mustStageClose(t, e, runID, "explore")
+	mustWorker(t, e, hostRun{runID, tok}, "explore", "explorer", "", "")
+	mustStageClose(t, e, hostRun{runID, tok}, "explore")
 
-	wid, _, err := e.WorkerStart(runID, "propose", "proposer", "")
+	wid, _, err := e.WorkerStart(runID, "propose", "proposer", "", tok)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, bad := range []string{"../escape", "/etc/passwd", "evil", "secret.txt"} {
-		if _, err := e.WorkerComplete(runID, wid, "", WorkerOutcome{Result: "r", Artifacts: map[string]string{bad: "x"}}); err == nil {
+		if _, err := e.WorkerComplete(runID, wid, "", tok, WorkerOutcome{Result: "r", Artifacts: map[string]string{bad: "x"}}); err == nil {
 			t.Fatalf("artifact name %q must be rejected", bad)
 		}
 	}

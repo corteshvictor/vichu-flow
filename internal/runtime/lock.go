@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -38,7 +39,7 @@ type LockStatus struct {
 // `vichu status` to surface orphaned locks.
 func (s *Store) InspectLock(runID string) (LockStatus, error) {
 	var lk core.Lock
-	if err := readJSON(s.lockPath(runID), &lk); err != nil {
+	if err := readJSON(s.projectRoot, s.lockPath(runID), &lk); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return LockStatus{Present: false}, nil
 		}
@@ -58,12 +59,29 @@ type Handle struct {
 	lock core.Lock
 }
 
-// AcquireLock takes the lock for a run. It succeeds if no lock exists or the
-// existing lock is orphaned (owner process gone or heartbeat expired);
-// otherwise it returns ErrLocked. Acquisition is atomic: the lock file is
-// hard-linked into place, so two racing processes can never both believe they
-// own the run.
+// AcquireLock takes the lock for a run, CREATING the run directory if needed. It is for the run's
+// birth (start) — where materializing the directory is exactly the point. It succeeds if no lock
+// exists or the existing lock is orphaned (owner process gone or heartbeat expired); otherwise it
+// returns ErrLocked. Acquisition is atomic: the lock file is hard-linked into place, so two racing
+// processes can never both believe they own the run.
 func (s *Store) AcquireLock(runID string) (*Handle, error) {
+	return s.acquireLock(runID, true)
+}
+
+// AcquireLockExisting takes the lock ONLY for a run that already exists on disk. A run id with no
+// state.json returns ErrRunNotFound and NOTHING is created — a rejected operation (resuming or
+// driving a nonexistent id) must leave no trace on disk (I2). Because the acquire below does not
+// create the directory, a run deleted concurrently also fails (the lock's temp-file create errors)
+// rather than conjuring the directory back. Used by resume and the host-first op commands, which
+// only ever act on a run that was already started.
+func (s *Store) AcquireLockExisting(runID string) (*Handle, error) {
+	if !s.RunExists(runID) {
+		return nil, ErrRunNotFound
+	}
+	return s.acquireLock(runID, false)
+}
+
+func (s *Store) acquireLock(runID string, createDir bool) (*Handle, error) {
 	host, _ := os.Hostname()
 	now := time.Now().UTC()
 	lk := core.Lock{
@@ -76,9 +94,14 @@ func (s *Store) AcquireLock(runID string) (*Handle, error) {
 	}
 
 	// Fast path: create the lock exclusively. Exactly one racer wins.
-	err := s.acquireLockFile(runID, &lk)
+	err := s.acquireLockFile(runID, &lk, createDir)
 	if err == nil {
 		return &Handle{store: s, runID: runID, lock: lk}, nil
+	}
+	// No-create acquire on a run whose directory is gone: the temp-file create fails with
+	// ErrNotExist. Report it as "run not found", never recreate the directory.
+	if !createDir && errors.Is(err, fs.ErrNotExist) {
+		return nil, ErrRunNotFound
 	}
 	if !errors.Is(err, fs.ErrExist) {
 		return nil, err
@@ -98,9 +121,12 @@ func (s *Store) AcquireLock(runID string) (*Handle, error) {
 	if rerr := os.Remove(s.lockPath(runID)); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
 		return nil, rerr
 	}
-	if err := s.acquireLockFile(runID, &lk); err != nil {
+	if err := s.acquireLockFile(runID, &lk, createDir); err != nil {
 		if errors.Is(err, fs.ErrExist) {
 			return nil, ErrLocked
+		}
+		if !createDir && errors.Is(err, fs.ErrNotExist) {
+			return nil, ErrRunNotFound
 		}
 		return nil, err
 	}
@@ -110,16 +136,20 @@ func (s *Store) AcquireLock(runID string) (*Handle, error) {
 // acquireLockFile atomically creates the lock file with lk's content, failing
 // with fs.ErrExist if a lock already exists. It writes a temp file then
 // hard-links it into place; os.Link is atomic and refuses to clobber an
-// existing target, which is what makes acquisition race-free.
-func (s *Store) acquireLockFile(runID string, lk *core.Lock) error {
-	if err := os.MkdirAll(s.RunDir(runID), 0o755); err != nil {
-		return err
+// existing target, which is what makes acquisition race-free. When createDir is
+// false the run directory is NOT created: a CreateTemp into a missing directory
+// fails with ErrNotExist, which the caller maps to ErrRunNotFound.
+func (s *Store) acquireLockFile(runID string, lk *core.Lock, createDir bool) error {
+	if createDir {
+		if err := os.MkdirAll(filepath.Dir(s.lockPath(runID)), 0o755); err != nil {
+			return err
+		}
 	}
 	data, err := json.MarshalIndent(lk, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(s.RunDir(runID), ".lock-*")
+	tmp, err := os.CreateTemp(filepath.Dir(s.lockPath(runID)), ".lock-*")
 	if err != nil {
 		return err
 	}
@@ -145,13 +175,13 @@ func (h *Handle) Heartbeat() error {
 		return ErrLockLost
 	}
 	h.lock.HeartbeatAt = time.Now().UTC()
-	return writeJSON(h.store.lockPath(h.runID), &h.lock)
+	return writeJSON(h.store.projectRoot, h.store.lockPath(h.runID), &h.lock)
 }
 
 // stillOwned reports whether the on-disk lock still carries this handle's token.
 func (h *Handle) stillOwned() bool {
 	var cur core.Lock
-	if err := readJSON(h.store.lockPath(h.runID), &cur); err != nil {
+	if err := readJSON(h.store.projectRoot, h.store.lockPath(h.runID), &cur); err != nil {
 		return false
 	}
 	return cur.Token != "" && cur.Token == h.lock.Token
@@ -187,7 +217,7 @@ func (h *Handle) Release() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	var cur core.Lock
-	if err := readJSON(h.store.lockPath(h.runID), &cur); err != nil {
+	if err := readJSON(h.store.projectRoot, h.store.lockPath(h.runID), &cur); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}

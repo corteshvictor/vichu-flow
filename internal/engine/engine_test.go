@@ -268,6 +268,62 @@ func failingGate() config.OSCommand {
 	return config.OSCommand{Unix: "false", Windows: "cmd /c exit 1"}
 }
 
+// TestHeadlessNeverReportsCompletedWithoutPersisting: a headless run whose terminal-state
+// write fails must return an ERROR and leave the on-disk state non-completed — never print
+// "completed" over a state.json it could not write. In host-first this was already fatal
+// (strict scope); headless degraded criticalWrite to a warning and lied about the outcome.
+func TestHeadlessNeverReportsCompletedWithoutPersisting(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses chmod to make the run dir unwritable")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory write bits")
+	}
+	dir := newTestRepo(t)
+	e := testEngine(t, dir)
+	// A gate that passes but makes the run directory read-only, so the subsequent
+	// completion write fails — exactly the reviewer's "removed write perms mid-run".
+	e.cfg.Commands = map[string]config.OSCommand{
+		"test": {Unix: "sh -c 'chmod -R 0500 .vichu/runs/$(ls -t .vichu/runs | head -1); exit 0'"},
+	}
+
+	state, err := e.Start(context.Background(), "task", "quick")
+	if err == nil {
+		t.Fatal("a run whose terminal write failed must return an error, not nil")
+	}
+	if state != nil && state.Status == core.StatusCompleted {
+		// The in-memory state may read completed, but the CLI keys off the returned error;
+		// what must never happen is the caller seeing (completed, nil).
+		if err == nil {
+			t.Fatal("returned completed with no error")
+		}
+	}
+	// Make the tree writable again (the gate chmod'd it recursively) so the DURABLE state can
+	// be read and t.TempDir cleanup can remove it.
+	runDir := rt.Open(dir).RunDir(firstRunID(t, dir))
+	_ = filepath.WalkDir(runDir, func(p string, _ os.DirEntry, _ error) error {
+		_ = os.Chmod(p, 0o700)
+		return nil
+	})
+	persisted, lerr := rt.Open(dir).LoadState(firstRunID(t, dir))
+	if lerr != nil {
+		t.Fatalf("load persisted state: %v", lerr)
+	}
+	if persisted.Status == core.StatusCompleted {
+		t.Fatal("state.json says completed, but the completion write had failed — the kernel lied")
+	}
+}
+
+// firstRunID returns the id of the only run in the store (test helper).
+func firstRunID(t *testing.T, dir string) string {
+	t.Helper()
+	ids, err := rt.Open(dir).ListRuns()
+	if err != nil || len(ids) == 0 {
+		t.Fatalf("no runs found: %v", err)
+	}
+	return ids[0]
+}
+
 func TestCancelInterruptsActiveRun(t *testing.T) {
 	dir := newTestRepo(t)
 	store := rt.Open(dir)
@@ -460,6 +516,76 @@ func TestReadOnlyStageBlocksOnMutation(t *testing.T) {
 	}
 }
 
+// TestReadOnlyStageIgnoresHostLocalState: the coding HOST rewrites its own
+// machine-local state mid-run — Claude Code persists an approved permission to
+// .claude/settings.local.json the moment the user says "yes" to a command. That is the
+// host's bookkeeping, not the agent's work on the code, so it must not BLOCK a
+// read-only stage; otherwise every explore/propose/plan fails the instant a user
+// approves anything, for a file the agent never touched.
+//
+// This is the GIT provider, where the audit sees what git sees: many users (and Claude
+// Code's own setup guidance) gitignore settings.local.json, and a gitignored file is
+// outside the audit — the same as any .env. On the FILESYSTEM provider we do record it,
+// flagged host_bookkeeping: see TestHostLocalStateIsRecordedNotHidden.
+func TestReadOnlyStageIgnoresHostLocalState(t *testing.T) {
+	dir := newTestRepo(t)
+	store := rt.Open(dir)
+	repo, _ := workspace.Detect(dir)
+
+	cfg := config.Default()
+	cfg.Workspace.RequireCleanTree = "allow"
+	check := "test -f src/feature.txt"
+	if runtime.GOOS == "windows" {
+		check = "cmd /c if exist src\\feature.txt (exit 0) else (exit 1)"
+	}
+	cfg.Commands = map[string]config.OSCommand{"test": {Unix: check, Windows: check}}
+
+	reg := adapters.NewRegistry()
+	reg.Register(adapters.FakeName, func() (adapters.Adapter, error) {
+		return adapters.NewFake(adapters.FakeScript{
+			Actions: map[string][]adapters.FakeAction{
+				// The host writes its permission allowlist during the READ-ONLY stage.
+				"explorer": {{Type: "write_file", Path: ".claude/settings.local.json",
+					Content: "{\"permissions\":{\"allow\":[\"Bash(go version *)\"]}}\n"}},
+				"implementer": {{Type: "write_file", Path: "src/feature.txt", Content: "feature\n"}},
+			},
+		}), nil
+	})
+	e := New(Options{Store: store, Registry: reg, Config: cfg, Repo: repo})
+
+	state, err := e.Start(context.Background(), "task", "quick")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Status != core.StatusCompleted {
+		t.Fatalf("host-local state written during a read-only stage must not block the run, got %s (%s)",
+			state.Status, state.BlockedReason)
+	}
+	// Whether git surfaces it depends on the user's ignore rules; what must ALWAYS hold
+	// is that if it is recorded, it is recorded as the HOST's bookkeeping — never
+	// attributed to the worker.
+	if m, ok := findMutation(store, state.RunID, ".claude/settings.local.json"); ok && !m.HostBookkeeping {
+		t.Fatal("the host's own settings.local.json must never be attributed to the worker")
+	}
+}
+
+// findMutation returns the recorded mutation for a path across the run's workers.
+func findMutation(store *rt.Store, runID, path string) (core.Mutation, bool) {
+	workers, _ := store.ListWorkers(runID)
+	for _, w := range workers {
+		r, err := store.LoadMutationReport(runID, w)
+		if err != nil {
+			continue
+		}
+		for _, m := range r.Mutations {
+			if m.Path == path {
+				return m, true
+			}
+		}
+	}
+	return core.Mutation{}, false
+}
+
 func TestBudgetExhaustionBlocksRun(t *testing.T) {
 	dir := newTestRepo(t)
 	store := rt.Open(dir)
@@ -526,6 +652,46 @@ func TestAgentInvocationBudgetGatesOnlyAgentStarts(t *testing.T) {
 			t.Fatalf("only explore should have run, got workers %v", workers)
 		}
 	})
+}
+
+// TestPolicyBlockedCommandConsumesNoBudget: the invocation counter must not be spent by a worker
+// that never reached the adapter. A shell command the policy blocks (git push, default config)
+// blocks the run BEFORE dispatch; if it had already bumped agent_invocations, a `resume` after
+// fixing the config would find the budget gone though no provider was ever called.
+func TestPolicyBlockedCommandConsumesNoBudget(t *testing.T) {
+	dir := newTestRepo(t)
+	store := rt.Open(dir)
+	repo, _ := workspace.Detect(dir)
+	cfg := config.Default()
+	cfg.Workspace.RequireCleanTree = "allow"
+	cfg.Agents["explorer"] = config.AgentConfig{Provider: "shell", Command: "git push origin main"}
+
+	reg := adapters.NewRegistry()
+	reg.Register(adapters.ShellName, func() (adapters.Adapter, error) { return adapters.NewShell(), nil })
+	reg.Register(adapters.FakeName, func() (adapters.Adapter, error) { return adapters.NewFake(adapters.FakeScript{}), nil })
+	e := New(Options{Store: store, Registry: reg, Config: cfg, Repo: repo})
+
+	state, err := e.Start(context.Background(), "task", "quick")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Status != core.StatusBlocked {
+		t.Fatalf("a policy-blocked command must block the run, got %s (%s)", state.Status, state.BlockedReason)
+	}
+	// Neither the returned state nor the PERSISTED one (what resume reads) may show a consumed slot.
+	if state.Budgets.AgentInvocations != 0 {
+		t.Fatalf("policy-blocked worker consumed a budget slot in memory: agent_invocations=%d", state.Budgets.AgentInvocations)
+	}
+	persisted, err := store.LoadState(state.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Budgets.AgentInvocations != 0 {
+		t.Fatalf("policy-blocked worker consumed a budget slot on disk: agent_invocations=%d", persisted.Budgets.AgentInvocations)
+	}
+	if workers, _ := store.ListWorkers(state.RunID); len(workers) != 0 {
+		t.Fatalf("a policy-blocked worker must not create a worker record, got %v", workers)
+	}
 }
 
 func TestBlockedFixAcceptChangesCompletes(t *testing.T) {
@@ -1266,6 +1432,48 @@ func TestMutationPolicyVerdict(t *testing.T) {
 	}
 }
 
+// TestReadOnlyStageBlocksOnAnIgnoredFile: being gitignored is NOT a license to mutate.
+// `Derived` was briefly treated as "the project declared this disposable", which exempted
+// it from the read-only check — but an ignored path can just as easily be a private note, a
+// credential or a certificate, and a global gitignore can make it one the project never
+// mentioned. A read-only worker that touched anything blocks. The only exemption is the
+// host's own bookkeeping, which the agent did not write.
+func TestReadOnlyStageBlocksOnAnIgnoredFile(t *testing.T) {
+	sec := config.Default().Security
+	roStage := workflows.Stage{Name: "explore", ReadOnly: true}
+
+	ignored := core.Mutation{Path: "private.notes", Kind: core.MutationModified, Derived: true}
+	if v := mutationPolicyVerdict(roStage, []core.Mutation{ignored}, sec); v == "" {
+		t.Error("a read-only worker that overwrote an ignored file must block — ignored is not disposable")
+	}
+	hostState := core.Mutation{Path: ".claude/settings.local.json", HostBookkeeping: true}
+	if v := mutationPolicyVerdict(roStage, []core.Mutation{hostState}, sec); v != "" {
+		t.Errorf("the host's own permission file is the one exemption, got %q", v)
+	}
+}
+
+// TestGateOutputAllowed: a gate may only rewrite a pre-existing file the project has
+// EXPLICITLY declared as a gate output. Inferring it from "the file is gitignored" is what
+// let a gate overwrite a private note and still reach `completed`.
+func TestGateOutputAllowed(t *testing.T) {
+	coverage := core.Mutation{Path: "coverage.out", Kind: core.MutationModified, Derived: true}
+	notes := core.Mutation{Path: "private.notes", Kind: core.MutationModified, Derived: true}
+	env := core.Mutation{Path: ".env", Kind: core.MutationModified, Derived: true, Sensitive: true}
+
+	if gateOutputAllowed(coverage, nil) {
+		t.Error("nothing is disposable until the project says so — an empty allowlist allows nothing")
+	}
+	if !gateOutputAllowed(coverage, []string{"coverage.out"}) {
+		t.Error("a declared gate output must be allowed")
+	}
+	if gateOutputAllowed(notes, []string{"coverage.out"}) {
+		t.Error("an ignored file that is NOT declared must still block")
+	}
+	if gateOutputAllowed(env, []string{".env", "*"}) {
+		t.Error("a sensitive path can never be allowlisted, however hard you try")
+	}
+}
+
 func hasEvent(events []core.Event, name string) bool {
 	for _, ev := range events {
 		if ev.Event == name {
@@ -1290,4 +1498,194 @@ func mutationRecorded(store *rt.Store, runID, path string) bool {
 		}
 	}
 	return false
+}
+
+// TestTransitionEmitsNoEventWhenStateDidNotPersist is the deterministic regression for the
+// "phantom transition" bug: advanceStage saved state and then UNCONDITIONALLY emitted
+// stage_completed + stage_transition, so a failed state write left the public audit trail
+// claiming a transition the authoritative state.json never recorded. Persist → check → emit.
+func TestTransitionEmitsNoEventWhenStateDidNotPersist(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses chmod to make the run dir unwritable")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory write bits")
+	}
+	dir := newTestRepo(t)
+	e := testEngine(t, dir)
+	store := rt.Open(dir)
+
+	state := &core.State{
+		RunID: "run-1", Status: core.StatusActive, CurrentStage: "explore",
+		Stages: map[string]core.StageStatus{"explore": core.StageActive, "implement": core.StagePending},
+	}
+	if err := store.CreateRun(state); err != nil {
+		t.Fatal(err)
+	}
+	// The transition write must land under a strict scope for the guard to see the failure.
+	e.strict = &strictScope{}
+
+	// Make the run directory unwritable, so the transition's SaveState fails.
+	runDir := store.RunDir("run-1")
+	if err := os.Chmod(runDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(runDir, 0o700) })
+
+	stage := workflows.Stage{Name: "explore", Kind: workflows.KindWorker, Next: "implement"}
+	if e.advanceStage(state, stage) {
+		t.Fatal("advanceStage must report failure when the transition state did not persist")
+	}
+
+	// The audit trail must NOT claim the transition happened.
+	_ = os.Chmod(runDir, 0o700)
+	events, _ := store.ReadEvents("run-1")
+	if hasEvent(events, core.EventStageTransition) {
+		t.Fatal("a stage_transition event was written for a transition that never persisted — the kernel lied")
+	}
+	if hasEvent(events, core.EventStageCompleted) {
+		t.Fatal("a stage_completed event was written for a stage whose transition never persisted")
+	}
+	// And the persisted state still says explore.
+	persisted, err := store.LoadState("run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.CurrentStage != "explore" {
+		t.Fatalf("persisted stage moved to %q despite the write failing", persisted.CurrentStage)
+	}
+}
+
+// TestGateDoesNotRunWhenStageStartEventFails: a gate command can have real, non-idempotent
+// effects, so it must not execute if the event announcing it could not be persisted — a retry
+// would re-run the whole operation. Reproduces the reviewer's events.ndjson-symlink case.
+func TestGateDoesNotRunWhenStageStartEventFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a symlink to make the event write fail")
+	}
+	dir := newTestRepo(t)
+	e := testEngine(t, dir)
+	e.strict = &strictScope{}
+	store := rt.Open(dir)
+
+	// A gate that leaves an observable marker if it runs.
+	marker := filepath.Join(dir, "gate-ran.txt")
+	e.cfg.Commands = map[string]config.OSCommand{
+		"test": {Unix: "sh -c 'echo ran > gate-ran.txt'", Windows: "cmd /c echo ran> gate-ran.txt"},
+	}
+
+	state := &core.State{
+		RunID: "run-1", Status: core.StatusActive, CurrentStage: "verify",
+		Stages: map[string]core.StageStatus{"verify": core.StageActive},
+	}
+	if err := store.CreateRun(state); err != nil {
+		t.Fatal(err)
+	}
+	// Plant events.ndjson as a symlink escaping the runtime root, so the append is refused.
+	outside := filepath.Join(t.TempDir(), "victim")
+	if err := os.WriteFile(outside, []byte("ORIG\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(store.RunDir("run-1"), "events.ndjson")); err != nil {
+		t.Fatal(err)
+	}
+
+	stage := workflows.Stage{Name: "verify", Kind: workflows.KindGate, Gates: []string{"test"}}
+	advance, err := e.runGateStage(context.Background(), state, nil, stage)
+
+	if advance {
+		t.Fatal("the stage must not advance when the gate could not be safely started")
+	}
+	if err == nil {
+		t.Fatal("a failed gate-start event must surface as an error")
+	}
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Fatal("the gate command RAN even though its start event could not be persisted")
+	}
+}
+
+// TestWorkerAdapterNotInvokedWhenStartEventFails: the adapter must not launch if the
+// worker_started event could not be persisted — the guard that used to be checked only on the
+// state save is now also checked on the EVENT, so a dispatched agent always has a durable
+// record it began. The fake implementer writes src/feature.txt if it runs; its absence proves
+// the adapter never ran.
+func TestWorkerAdapterNotInvokedWhenStartEventFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a symlink to make the event write fail")
+	}
+	dir := newTestRepo(t)
+	e := testEngine(t, dir)
+	e.strict = &strictScope{}
+	store := rt.Open(dir)
+
+	state := &core.State{
+		RunID: "run-1", Status: core.StatusActive, CurrentStage: "implement",
+		Stages: map[string]core.StageStatus{"implement": core.StageActive}, Iterations: map[string]int{},
+	}
+	if err := store.CreateRun(state); err != nil {
+		t.Fatal(err)
+	}
+	// events.ndjson → a symlink escaping the runtime root, so worker_started cannot persist.
+	outside := filepath.Join(t.TempDir(), "victim")
+	if err := os.WriteFile(outside, []byte("ORIG\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(store.RunDir("run-1"), "events.ndjson")); err != nil {
+		t.Fatal(err)
+	}
+
+	rs := &runState{wf: nil, pack: "", startedAt: time.Now()}
+	stage := workflows.Stage{Name: "implement", Kind: workflows.KindWorker, Role: "implementer", Next: "verify"}
+	advance, err := e.runWorkerStage(context.Background(), state, rs, stage)
+
+	if advance {
+		t.Fatal("the stage must not advance when the worker could not be safely started")
+	}
+	if err == nil {
+		t.Fatal("a failed worker_started event must surface as an error")
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "src", "feature.txt")); statErr == nil {
+		t.Fatal("the adapter RAN (wrote its file) even though worker_started could not be persisted")
+	}
+}
+
+// TestHeadlessBlocksOnNegativeUsage: a headless adapter reporting negative tokens must block
+// the run — accruing them unchecked used to drive the run UNDER its own budget and still
+// reach `completed`. Host-first validated; headless did not.
+func TestHeadlessBlocksOnNegativeUsage(t *testing.T) {
+	dir := newTestRepo(t)
+	store := rt.Open(dir)
+	repo, _ := workspace.Detect(dir)
+
+	cfg := config.Default()
+	cfg.Workspace.RequireCleanTree = "allow"
+	cfg.Commands = nil
+	noGates := false
+	cfg.Workflow.RequireGates = &noGates
+
+	reg := adapters.NewRegistry()
+	reg.Register(adapters.FakeName, func() (adapters.Adapter, error) {
+		return adapters.NewFake(adapters.FakeScript{TokensIn: -100, TokensOut: -100}), nil
+	})
+	e := New(Options{Store: store, Registry: reg, Config: cfg, Repo: repo})
+
+	state, err := e.Start(context.Background(), "task", "quick")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if state.Status != core.StatusBlocked {
+		t.Fatalf("negative usage must block the run, got %s", state.Status)
+	}
+	if state.Budgets.TokensInSpent < 0 {
+		t.Fatalf("negative tokens were accrued into the budget: %d", state.Budgets.TokensInSpent)
+	}
+	// The worker must be left with a TERMINAL status (not running), or resume mis-classifies it
+	// as interrupted and cancels a worker that actually finished.
+	ws, werr := store.LoadWorkerStatus(state.RunID, "explore-01")
+	if werr != nil {
+		t.Fatalf("load worker status: %v", werr)
+	}
+	if ws.Status == core.WorkerRunning || ws.FinishedAt == nil {
+		t.Fatalf("worker left non-terminal after an invalid-usage block: status=%s finished_at=%v", ws.Status, ws.FinishedAt)
+	}
 }
