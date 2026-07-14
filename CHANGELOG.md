@@ -11,6 +11,13 @@ Refactors), in the spirit of [Keep a Changelog](https://keepachangelog.com).
 
 <!-- release-please will insert released versions below this line. -->
 
+## [0.4.1](https://github.com/corteshvictor/vichu-flow/compare/v0.4.0...v0.4.1) (2026-07-14)
+
+
+### Bug Fixes
+
+* harden host-first audit integrity, confinement, and cancel/resume honesty ([#27](https://github.com/corteshvictor/vichu-flow/issues/27)) ([ca0edb5](https://github.com/corteshvictor/vichu-flow/commit/ca0edb5075b1e9b3ca329072b96beb07c45b4737))
+
 ## [0.4.0](https://github.com/corteshvictor/vichu-flow/compare/v0.3.0...v0.4.0) (2026-06-18)
 
 
