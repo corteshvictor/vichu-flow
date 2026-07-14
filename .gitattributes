@@ -1,0 +1,7 @@
+# Host-pack files are go:embed'd into the binary and hashed BYTE-FOR-BYTE — by
+# known-hashes.json, by pack-ownership/integrity checks, and by upgrade verification.
+# Force LF in the working tree so the bytes, and therefore the SHA-256, are identical
+# on every platform. Without this, a Windows checkout rewrites the `.md` files to CRLF,
+# their hash stops matching the catalog, and every pack-integrity check fails.
+internal/hostpacks/packs/** text eol=lf
+cmd/vichu/testdata/packs/** text eol=lf
