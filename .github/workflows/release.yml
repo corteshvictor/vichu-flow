@@ -50,3 +50,44 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Recording a release's host pack can ONLY happen after the tag exists (packhistory reads the
+  # pack from the tag's tree), so it cannot live in the Release PR that creates the tag. This job
+  # records it the moment the tag is cut and opens a `chore` PR with the fixtures + hashes, which a
+  # human merges. Without it, TestEveryReleasedPackIsRecorded turns main red after every release and
+  # someone has to remember to run the tool by hand.
+  record-pack:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0                              # packhistory reads the tag's TREE
+          # The dedicated token (not the default GITHUB_TOKEN) so the PR this opens DOES trigger CI.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ">=1.26.5"
+      - name: Record the released pack and open a PR
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          git fetch --tags origin "$TAG"   # ensure the just-created tag is present (checkout usually has it)
+          go run ./tools/packhistory --host claude-code --tag "$TAG"
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "Pack for $TAG is already recorded — nothing to do."
+            exit 0
+          fi
+          branch="chore/record-pack-$TAG"
+          git switch -c "$branch"
+          git add cmd/vichu/testdata/packs internal/hostpacks/packs
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "chore: record $TAG host-pack fixtures and hashes"
+          git push origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "chore: record $TAG host-pack fixtures and hashes" \
+            --body "Automated post-release step: \`packhistory\` recorded the host pack shipped by \`$TAG\` (checked-in fixtures under \`cmd/vichu/testdata/packs\` plus the sha256 catalog in \`known-hashes.json\`). This is what \`TestEveryReleasedPackIsRecorded\` requires and what lets \`vichu init\`/\`uninstall\` recognize a user's pack from \`$TAG\`. Review and merge."
