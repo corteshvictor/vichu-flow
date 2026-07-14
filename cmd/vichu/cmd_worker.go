@@ -43,8 +43,13 @@ func cmdWorkerStart(args []string) error {
 	stage := fs.String("stage", "", i18n.T("worker.flag_stage"))
 	role := fs.String("role", "", i18n.T("worker.flag_role"))
 	opID := fs.String("op-id", "", i18n.T("op.flag_id"))
+	tokenR := driverTokenFlags(fs)
 	jsonOut := fs.Bool("json", false, i18n.T("run.flag_json"))
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	token, err := tokenR.resolve(false)
+	if err != nil {
 		return err
 	}
 	if *run == "" || *stage == "" || *role == "" {
@@ -55,7 +60,7 @@ func cmdWorkerStart(args []string) error {
 	if err != nil {
 		return err
 	}
-	workerID, blockReason, err := proj.engineForOutput(*jsonOut).WorkerStart(*run, *stage, *role, *opID)
+	workerID, blockReason, err := proj.engineForOutput(*jsonOut).WorkerStart(*run, *stage, *role, *opID, token)
 	if err != nil {
 		return err
 	}
@@ -86,6 +91,7 @@ func cmdWorkerComplete(args []string) error {
 	result := fs.String("result", "", i18n.T("worker.flag_result"))
 	resultStdin := fs.Bool("result-stdin", false, i18n.T("worker.flag_result_stdin"))
 	opID := fs.String("op-id", "", i18n.T("op.flag_id"))
+	tokenR := driverTokenFlags(fs)
 	session := fs.String("session", "", i18n.T("worker.flag_session"))
 	tokensIn := fs.Int("tokens-in", 0, i18n.T("worker.flag_tokens_in"))
 	tokensOut := fs.Int("tokens-out", 0, i18n.T("worker.flag_tokens_out"))
@@ -98,6 +104,10 @@ func cmdWorkerComplete(args []string) error {
 	}
 	if *run == "" || *worker == "" {
 		return errors.New(i18n.T("worker.need_complete_flags"))
+	}
+	token, err := tokenR.resolve(*resultStdin)
+	if err != nil {
+		return err
 	}
 
 	proj, err := openWorkerProject()
@@ -119,7 +129,7 @@ func cmdWorkerComplete(args []string) error {
 		TokensReported: tokensReported, CostReported: costReported,
 		Artifacts: artifacts,
 	}
-	blockReason, err := proj.engineForOutput(*jsonOut).WorkerComplete(*run, *worker, *opID, out)
+	blockReason, err := proj.engineForOutput(*jsonOut).WorkerComplete(*run, *worker, *opID, token, out)
 	if err != nil {
 		return err
 	}

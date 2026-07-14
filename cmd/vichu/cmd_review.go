@@ -35,6 +35,7 @@ func cmdReviewComplete(args []string) error {
 	verdict := fs.String("verdict", "", i18n.T("review.flag_verdict"))
 	verdictStdin := fs.Bool("verdict-stdin", false, i18n.T("review.flag_verdict_stdin"))
 	opID := fs.String("op-id", "", i18n.T("op.flag_id"))
+	tokenR := driverTokenFlags(fs)
 	session := fs.String("session", "", i18n.T("worker.flag_session"))
 	tokensIn := fs.Int("tokens-in", 0, i18n.T("worker.flag_tokens_in"))
 	tokensOut := fs.Int("tokens-out", 0, i18n.T("worker.flag_tokens_out"))
@@ -45,6 +46,10 @@ func cmdReviewComplete(args []string) error {
 	}
 	if *run == "" || *worker == "" {
 		return errors.New(i18n.T("review.need_flags"))
+	}
+	token, err := tokenR.resolve(*verdictStdin)
+	if err != nil {
+		return err
 	}
 
 	proj, err := openWorkerProject()
@@ -65,7 +70,7 @@ func cmdReviewComplete(args []string) error {
 		TokensIn: *tokensIn, TokensOut: *tokensOut, CostUSD: *costUSD,
 		TokensReported: tokensReported, CostReported: costReported,
 	}
-	blockReason, err := proj.engineForOutput(*jsonOut).ReviewComplete(*run, *worker, *opID, out)
+	blockReason, err := proj.engineForOutput(*jsonOut).ReviewComplete(*run, *worker, *opID, token, out)
 	if err != nil {
 		return err
 	}

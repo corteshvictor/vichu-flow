@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,9 @@ import (
 	"github.com/corteshvictor/vichu-flow/internal/runtime"
 	"github.com/corteshvictor/vichu-flow/internal/workspace"
 )
+
+// gitignoreFile is the project's ignore file that `init`/`new` append the runtime dir to.
+const gitignoreFile = ".gitignore"
 
 func cmdInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
@@ -50,15 +54,17 @@ func cmdInit(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(cfgPath, []byte(config.DefaultYAML(detected, projectName)), 0o644); err != nil {
-		return err
-	}
-	// Always ignore the runtime dir, even with no .git yet: it holds prompts,
-	// results, and the filesystem provider's full baseline copy of the tree. A
-	// later `git init` would otherwise risk committing all of it. Writing a
-	// .gitignore does not force Git on anyone.
+	// .gitignore BEFORE vichu.yaml: vichu.yaml is the COMMIT point. If .gitignore cannot be
+	// written (e.g. it is a hostile symlink and the confined write refuses it), we fail with
+	// nothing committed — so a retry is not trapped by a half-written vichu.yaml reporting
+	// "already exists". Always ignore the runtime dir even with no .git yet: it holds prompts,
+	// results, and the filesystem baseline; a later `git init` must not commit it.
 	gitignoreAdded, err := ensureGitignore(root)
 	if err != nil {
+		return err
+	}
+	yaml := config.DefaultYAML(config.DefaultOptions{Detected: detected, ProjectName: projectName, WorkspaceProvider: *provider})
+	if err := confinedProjectWrite(root, config.FileName, []byte(yaml), 0o644); err != nil {
 		return err
 	}
 	printInitSummary(root, detected, seeded, gitignoreAdded)
@@ -149,14 +155,52 @@ func printInitSummary(root string, detected config.Detected, seeded []string, gi
 	fmt.Println("\n" + i18n.T("init.next"))
 }
 
+// confinedProjectWrite writes rel under root atomically and confined, so a symlink an
+// attacker left in the project (a cloned repo, a hostile checkout) cannot redirect an init
+// or scaffold write to a file outside it — the rename replaces the symlink rather than
+// following it. Init runs before any agent, but a project's existing contents are still
+// untrusted input.
+func confinedProjectWrite(root, rel string, data []byte, mode os.FileMode) error {
+	pr, err := openProjectRoot(root)
+	if err != nil {
+		return err
+	}
+	defer pr.Close()
+	return pr.writeFileAtomic(rel, data, mode)
+}
+
 // ensureGitignore makes sure the runtime directory is ignored. Runs may contain
 // code fragments and prompts and must never be committed.
 func ensureGitignore(root string) (bool, error) {
 	entry := runtime.DirName + "/"
-	path := filepath.Join(root, ".gitignore")
 
-	data, err := os.ReadFile(path)
-	if err != nil && !os.IsNotExist(err) {
+	pr, err := openProjectRoot(root)
+	if err != nil {
+		return false, err
+	}
+	defer pr.Close()
+
+	// Lstat FIRST and refuse a symlink. writeFileAtomic replaces the destination with a regular
+	// file, so a `.gitignore` the user symlinked to a shared ignore file would be silently turned
+	// into a plain local file — breaking the sharing, and leaving the shared target stale — while
+	// os.Root would still FOLLOW an internal link on the read. And keep the file's existing mode:
+	// appending one line must not widen a 0600 .gitignore to 0644.
+	mode := fs.FileMode(0o644)
+	switch info, lerr := pr.lstat(gitignoreFile); {
+	case errors.Is(lerr, fs.ErrNotExist):
+		// no file yet — a fresh 0644 is correct
+	case lerr != nil:
+		return false, lerr
+	case info.Mode()&fs.ModeSymlink != 0:
+		return false, fmt.Errorf("%s is a symlink — refusing to append through it, because saving would replace the link with a regular file and break your shared config. Edit its target directly, then re-run", gitignoreFile)
+	default:
+		mode = info.Mode().Perm()
+	}
+
+	// Read WITHOUT following (the Lstat above already refused a symlink; this closes the TOCTOU).
+	// A missing one is an empty baseline.
+	data, err := pr.readFileNoFollow(gitignoreFile)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return false, err
 	}
 	for _, line := range strings.Split(string(data), "\n") {
@@ -165,16 +209,14 @@ func ensureGitignore(root string) (bool, error) {
 		}
 	}
 
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return false, err
-	}
-	defer f.Close()
+	// Read-modify-write ATOMICALLY (not append-in-place): writeFileAtomic replaces a symlink
+	// at the path rather than appending through it to whatever it points at.
 	prefix := ""
 	if len(data) > 0 && !strings.HasSuffix(string(data), "\n") {
 		prefix = "\n"
 	}
-	if _, err := f.WriteString(prefix + "\n# VichuFlow runtime (contains code fragments and prompts)\n" + entry + "\n"); err != nil {
+	next := string(data) + prefix + "\n# VichuFlow runtime (contains code fragments and prompts)\n" + entry + "\n"
+	if err := pr.writeFileAtomic(gitignoreFile, []byte(next), mode); err != nil {
 		return false, err
 	}
 	return true, nil

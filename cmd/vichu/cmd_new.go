@@ -4,12 +4,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	iofs "io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/corteshvictor/vichu-flow/internal/config"
 	"github.com/corteshvictor/vichu-flow/internal/i18n"
+	"github.com/corteshvictor/vichu-flow/internal/safeio"
 )
 
 // cmdNew scaffolds a brand-new project in its own directory from a template:
@@ -48,10 +50,7 @@ func cmdNew(args []string) error {
 		return err
 	}
 	root := filepath.Join(cwd, name)
-	if entries, _ := os.ReadDir(root); len(entries) > 0 && !*force {
-		return fmt.Errorf(i18n.T("new.exists"), name)
-	}
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	if err := prepareNewRoot(cwd, name, *force); err != nil {
 		return err
 	}
 
@@ -59,7 +58,8 @@ func cmdNew(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(root, config.FileName), []byte(config.DefaultYAML(tpl.Detected, name)), 0o644); err != nil {
+	yaml := config.DefaultYAML(config.DefaultOptions{Detected: tpl.Detected, ProjectName: name})
+	if err := confinedProjectWrite(root, config.FileName, []byte(yaml), 0o644); err != nil {
 		return err
 	}
 	if _, err := ensureGitignore(root); err != nil {
@@ -73,6 +73,30 @@ func cmdNew(args []string) error {
 	fmt.Printf("  %s\n", config.FileName)
 	fmt.Printf("\n"+i18n.T("new.next")+"\n", name)
 	return nil
+}
+
+// prepareNewRoot validates and creates the target directory for `vichu new`, through the
+// confined parent. It refuses a target that is a SYMLINK or a plain file — even with --force:
+// --force replaces files INSIDE a project, it does not authorize writing a whole project
+// through a symlinked root to somewhere outside the current directory. A dangling symlink
+// (Stat would say "not there") is rejected too, via Lstat.
+func prepareNewRoot(cwd, name string, force bool) error {
+	parent, err := safeio.Open(cwd)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = parent.Close() }()
+	if fi, lerr := parent.Lstat(name); lerr == nil {
+		if fi.Mode()&iofs.ModeSymlink != 0 || !fi.IsDir() {
+			return fmt.Errorf("%s already exists and is not a real directory (a symlink or a file) — refusing to create a project through it", name)
+		}
+	} else if !errors.Is(lerr, iofs.ErrNotExist) {
+		return lerr
+	}
+	if entries, _ := os.ReadDir(filepath.Join(cwd, name)); len(entries) > 0 && !force {
+		return fmt.Errorf(i18n.T("new.exists"), name)
+	}
+	return parent.MkdirAll(name, 0o755)
 }
 
 // validateProjectName requires a single safe directory name: not empty, not a
