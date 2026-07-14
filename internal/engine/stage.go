@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -19,6 +21,22 @@ import (
 // warnSaveWorkerStatus is the warn label used wherever a worker status write may
 // fail, kept as one constant so the message stays consistent.
 const warnSaveWorkerStatus = "save worker status"
+
+// buildWorkerPrompt assembles the worker's prompt: the base instruction plus, for a review
+// stage, the diff-only change set (so it judges the work without re-reading the whole repo).
+// It returns blocked=true when the change set cannot be assembled SAFELY — a changed file that
+// is a symlink (never followed) or unreadable — having blocked the run, so the caller stops
+// BEFORE the prompt is persisted or the reviewer is invoked, never sending external bytes or a
+// half-truth.
+func (e *Engine) buildWorkerPrompt(state *core.State, stage workflows.Stage, rs *runState) (prompt string, blocked bool) {
+	prompt = buildPrompt(rs.pack, stage.Instruction, state.Task, rs.lastSummary, e.cfg)
+	prompt, err := e.withReviewContext(prompt, state, stage.Name, stage.Kind == workflows.KindReview)
+	if err != nil {
+		e.block(state, fmt.Sprintf("cannot assemble the review change set: %v", err))
+		return "", true
+	}
+	return prompt, false
+}
 
 // runWorkerStage invokes an agent for a stage, capturing its events, result,
 // and the exact set of files it mutated. It returns advance=false (without
@@ -38,33 +56,15 @@ func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runS
 		return false, err
 	}
 
-	state.Budgets.AgentInvocations++
-	workerID := fmt.Sprintf("%s-%02d", stage.Name, state.Budgets.AgentInvocations)
-	prompt := buildPrompt(rs.pack, stage.Instruction, state.Task, rs.lastSummary, e.cfg)
-	// A review stage gets the change set inline (diff-only) so it judges the work
-	// without re-reading the whole repo — fewer tokens, less free exploration.
-	prompt = e.withReviewContext(prompt, state, stage.Name, stage.Kind == workflows.KindReview)
-
-	inv := adapters.Invocation{
-		Role:             stage.Role,
-		Prompt:           prompt,
-		WorkDir:          e.repo.Root(),
-		Model:            agentCfg.Model,
-		Effort:           agentCfg.Effort,
-		Iteration:        state.Iterations[stage.Name],
-		ReadOnly:         stage.ReadOnly,
-		AllowNonZeroExit: agentCfg.AllowNonZeroExit,
-		DisallowedTools:  e.policy.ClaudeDisallowedTools(),
-	}
-	if agentCfg.Provider == adapters.ShellName {
-		inv.Command = splitCommand(agentCfg.Command)
-		// Policy gate BEFORE execution: a worker command that needs human
-		// confirmation (or is denied) blocks the run instead of ever running.
-		if err := e.policy.CheckCommand(inv.Command); err != nil {
-			e.emit(state, stage.Name, workerID, "policy_blocked", map[string]any{"reason": err.Error()})
-			e.block(state, err.Error())
-			return false, nil
-		}
+	// Compute the NEXT worker's ordinal WITHOUT consuming the budget yet. A worker that never
+	// reaches the adapter — a policy-blocked command, a tracking failure — must not spend an
+	// invocation slot, or a `resume` after fixing the config finds the budget already gone though
+	// no provider was ever called. The slot is reserved below, at the commit point.
+	nextInvocation := state.Budgets.AgentInvocations + 1
+	workerID := fmt.Sprintf("%s-%02d", stage.Name, nextInvocation)
+	inv, prompt, blocked := e.prepareInvocation(state, stage, workerID, agentCfg, rs)
+	if blocked {
+		return false, nil
 	}
 
 	// Start mutation tracking BEFORE the worker runs — refuse to run an agent we
@@ -76,17 +76,17 @@ func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runS
 		return false, nil
 	}
 
-	now := time.Now().UTC()
+	// Committed to dispatch: consume the invocation slot now, so announceWorkerStart persists the
+	// bumped counter together with the worker's own record — one durable step, not a count that
+	// leaks ahead of a worker that may never have started.
+	state.Budgets.AgentInvocations = nextInvocation
 	ws := &core.WorkerStatus{
 		ID: workerID, Role: stage.Role, Adapter: adapter.Name(),
-		Stage: stage.Name, Status: core.WorkerRunning, StartedAt: now,
+		Stage: stage.Name, Status: core.WorkerRunning, StartedAt: time.Now().UTC(),
 	}
-	e.warn(e.store.SaveWorkerStatus(state.RunID, ws), warnSaveWorkerStatus)
-	e.warn(e.store.WriteWorkerFile(state.RunID, workerID, "prompt.md", []byte(prompt)), "write worker prompt")
-	state.ActiveWorker = workerID
-	state.NextAction = "running " + stage.Role
-	e.saveState(state)
-	e.emit(state, stage.Name, workerID, core.EventWorkerStarted, map[string]any{"adapter": adapter.Name(), "role": stage.Role})
+	if ok, err := e.announceWorkerStart(state, stage, ws, prompt); !ok {
+		return false, err
+	}
 
 	sess, err := e.startSession(ctx, adapter, state, rs, stage, inv)
 	if err != nil {
@@ -106,27 +106,16 @@ func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runS
 	// what an agent touched is non-negotiable, independent of the run's outcome.
 	policyBlock := e.trackMutations(state, stage, workerID, rs.baseSHA, tracker)
 
-	// Aggregate usage/cost for ANY worker that ran — an adapter can report real
-	// cost/tokens even on an error result (claude-code does), so the run's budget
-	// must reflect what was actually burned, not just successful workers.
-	e.accrueReportedUsage(state, stage.Name, workerID, result)
-	state.Budgets.WallClockSpentSeconds = rs.wallClockSpent()
+	if ok, uerr := e.accrueUsageOrBlock(state, stage, ws, workerID, result, rs); !ok {
+		return false, uerr
+	}
 
 	if err != nil {
 		return e.handleWorkerError(ctx, state, ws, workerID, err)
 	}
-
-	fin := time.Now().UTC()
-	ws.Status = core.WorkerDone
-	ws.FinishedAt = &fin
-	ws.SessionID = result.SessionID
-	e.warn(e.store.SaveWorkerStatus(state.RunID, ws), warnSaveWorkerStatus)
-	e.emit(state, stage.Name, workerID, core.EventWorkerFinished, map[string]any{"cost_usd": result.CostUSD})
-
-	rs.lastSummary = truncate(result.Markdown, 2000)
-	e.warn(e.store.SaveStageSummary(state.RunID, stage.Name, []byte(rs.lastSummary)), "save stage summary")
-	state.ActiveWorker = ""
-	e.saveState(state)
+	if ok, ferr := e.finishWorker(state, stage, ws, workerID, result, rs); !ok {
+		return false, ferr
+	}
 
 	if policyBlock != "" {
 		e.block(state, policyBlock)
@@ -151,25 +140,136 @@ func (e *Engine) runWorkerStage(ctx context.Context, state *core.State, rs *runS
 	return true, nil
 }
 
+// prepareInvocation builds the adapter invocation for a stage and, for a shell worker, runs
+// the pre-execution command policy. blocked=true means a shell command that needs human
+// confirmation (or is denied) blocked the run, and the caller must halt without dispatching.
+func (e *Engine) prepareInvocation(state *core.State, stage workflows.Stage, workerID string, agentCfg config.AgentConfig, rs *runState) (inv adapters.Invocation, prompt string, blocked bool) {
+	prompt, blocked = e.buildWorkerPrompt(state, stage, rs)
+	if blocked {
+		return adapters.Invocation{}, "", true
+	}
+	inv = adapters.Invocation{
+		Role:             stage.Role,
+		Prompt:           prompt,
+		WorkDir:          e.repo.Root(),
+		Model:            agentCfg.Model,
+		Effort:           agentCfg.Effort,
+		Iteration:        state.Iterations[stage.Name],
+		ReadOnly:         stage.ReadOnly,
+		AllowNonZeroExit: agentCfg.AllowNonZeroExit,
+		DisallowedTools:  e.policy.ClaudeDisallowedTools(),
+	}
+	if agentCfg.Provider == adapters.ShellName {
+		inv.Command = splitCommand(agentCfg.Command)
+		if cerr := e.policy.CheckCommand(inv.Command); cerr != nil {
+			e.emit(state, stage.Name, workerID, "policy_blocked", map[string]any{"reason": cerr.Error()})
+			e.block(state, cerr.Error())
+			return inv, prompt, true
+		}
+	}
+	return inv, prompt, false
+}
+
+// announceWorkerStart persists the worker record and state, then emits worker_started —
+// PERSIST → CHECK → ANNOUNCE, so a dispatched agent always has a durable record it began.
+// ok=false means a must-succeed write failed; the caller must NOT launch the adapter.
+//
+// status.json is the worker's very record of existing, so it is must-succeed (not warn): if
+// it did not land, the agent would run with no auditable worker at all. prompt.md stays
+// best-effort — a copy of the prompt for humans, not a safety record. The worker is left
+// `running` on a failure on purpose: reconcileInterruptedWorkers cancels it on resume,
+// rather than us cleaning up while the store is failing.
+func (e *Engine) announceWorkerStart(state *core.State, stage workflows.Stage, ws *core.WorkerStatus, prompt string) (ok bool, err error) {
+	e.criticalWrite(e.store.SaveWorkerStatus(state.RunID, ws), warnSaveWorkerStatus)
+	e.warn(e.store.WriteWorkerFile(state.RunID, ws.ID, "prompt.md", []byte(prompt)), "write worker prompt")
+	state.ActiveWorker = ws.ID
+	state.NextAction = "running " + stage.Role
+	if !e.saveStateOK(state) {
+		return false, nil // worker record or worker-start state did not persist — do not dispatch
+	}
+	e.emit(state, stage.Name, ws.ID, core.EventWorkerStarted, map[string]any{"adapter": ws.Adapter, "role": stage.Role})
+	if perr := e.persistFailed(); perr != nil {
+		return false, perr // the worker_started event did not persist — do not dispatch
+	}
+	return true, nil
+}
+
+// accrueUsageOrBlock validates the worker's reported usage, then accrues it into the run
+// budget. ok=false means the usage was invalid (negative/NaN cost or tokens) and the run is
+// now blocked — the caller must halt (with the returned error if a must-succeed write failed).
+// Evidence (result + mutations) is already persisted, so blocking here never loses the record
+// of what ran. Cost/tokens are accrued for ANY worker, even one that errored.
+func (e *Engine) accrueUsageOrBlock(state *core.State, stage workflows.Stage, ws *core.WorkerStatus, workerID string, result core.Result, rs *runState) (ok bool, err error) {
+	if uerr := validateReportedUsage(result.TokensIn, result.TokensOut, result.CostReported, result.CostUSD); uerr != nil {
+		// The worker DID run and produce evidence, but its numbers can't be trusted. Give it a
+		// TERMINAL status BEFORE blocking: leaving it `running` while block clears active_worker
+		// makes resume mis-classify it as interrupted and CANCEL it, though it actually finished.
+		// Critical write — if the terminal status does not land, do not announce the block.
+		fin := time.Now().UTC()
+		ws.Status = core.WorkerFailed
+		ws.FinishedAt = &fin
+		e.criticalWrite(e.store.SaveWorkerStatus(state.RunID, ws), warnSaveWorkerStatus)
+		if perr := e.persistFailed(); perr != nil {
+			return false, perr
+		}
+		e.block(state, fmt.Sprintf("worker %s reported invalid usage and the run cannot trust its budget: %v", workerID, uerr))
+		return false, nil
+	}
+	e.accrueReportedUsage(state, stage.Name, workerID, result)
+	state.Budgets.WallClockSpentSeconds = rs.wallClockSpent()
+	return true, nil
+}
+
+// finishWorker records a SUCCESSFUL worker's terminal state and announces it — PERSIST →
+// CHECK → ANNOUNCE, so the run never reaches `completed` with a worker whose done-status
+// never landed. ok=false means a must-succeed write failed and the caller must halt.
+func (e *Engine) finishWorker(state *core.State, stage workflows.Stage, ws *core.WorkerStatus, workerID string, result core.Result, rs *runState) (ok bool, err error) {
+	fin := time.Now().UTC()
+	ws.Status = core.WorkerDone
+	ws.FinishedAt = &fin
+	ws.SessionID = result.SessionID
+	e.criticalWrite(e.store.SaveWorkerStatus(state.RunID, ws), warnSaveWorkerStatus)
+	if perr := e.persistFailed(); perr != nil {
+		return false, perr
+	}
+	e.emit(state, stage.Name, workerID, core.EventWorkerFinished, map[string]any{"cost_usd": result.CostUSD})
+	rs.lastSummary = truncate(result.Markdown, 2000)
+	e.warn(e.store.SaveStageSummary(state.RunID, stage.Name, []byte(rs.lastSummary)), "save stage summary")
+	state.ActiveWorker = ""
+	e.saveState(state)
+	return true, nil
+}
+
 // applyVerdict parses the reviewer's structured verdict, persists it as the
 // review's evidence, emits events, and decides the branch. A missing or invalid
 // verdict, or a "blocked" status, stops the run with an explicit reason — it
 // NEVER falls through to "approved". "needs_fixes" loops to the fix stage until
 // the auto-fix budget (workflow.maxAutoIterations) is spent.
 func (e *Engine) applyVerdict(state *core.State, stage workflows.Stage, result core.Result) bool {
+	if err := e.persistReviewVerdict(state, stage, result); err != nil {
+		e.block(state, err.Error())
+		return false
+	}
+	return e.decideFromVerdict(state, stage)
+}
+
+// persistReviewVerdict parses the reviewer's structured verdict and persists it as
+// the review's EVIDENCE, emitting the verdict + findings events. It only records —
+// the branch is decided separately (decideFromVerdict), by reading this back. That
+// split is what lets host-first persist the evidence BEFORE committing the reviewer's
+// close and still recompute the same branch on a recovery.
+func (e *Engine) persistReviewVerdict(state *core.State, stage workflows.Stage, result core.Result) error {
 	iteration := state.Iterations[stage.Name]
 	v, err := core.ParseVerdictFromResult(result)
 	if err != nil {
-		e.block(state, fmt.Sprintf("review stage %q produced no valid verdict: %v", stage.Name, err))
-		return false
+		return fmt.Errorf("review stage %q produced no valid verdict: %v", stage.Name, err)
 	}
 	v.Stage, v.Iteration, v.CapturedAt = stage.Name, iteration, time.Now().UTC()
 	// The verdict is the public evidence that justifies the transition — and the
 	// engine reads it back to choose the branch. If it cannot be persisted, refuse
 	// to proceed rather than transition on evidence that was never recorded.
 	if err := e.store.SaveReviewVerdict(state.RunID, stage.Name, iteration, &v); err != nil {
-		e.block(state, fmt.Sprintf("cannot persist review verdict for %q (iteration %d): %v — refusing to transition on unrecorded evidence", stage.Name, iteration, err))
-		return false
+		return fmt.Errorf("cannot persist review verdict for %q (iteration %d): %v — refusing to transition on unrecorded evidence", stage.Name, iteration, err)
 	}
 	e.emit(state, stage.Name, "", core.EventReviewCompleted, map[string]any{
 		"status": string(v.Status), "findings": len(v.Findings), "iteration": iteration,
@@ -178,6 +278,21 @@ func (e *Engine) applyVerdict(state *core.State, stage workflows.Stage, result c
 		e.emit(state, stage.Name, "", core.EventReviewFindings, map[string]any{
 			"severity": string(f.Severity), "file": f.File, "message": f.Message,
 		})
+	}
+	return nil
+}
+
+// decideFromVerdict routes the run from the PERSISTED verdict — never from the
+// prompt, and never from an in-memory value the caller happened to hold. Reading it
+// back from disk is what makes the decision reproducible on a retry: the same
+// evidence always yields the same branch. "blocked", an exhausted auto-fix budget,
+// or an unreadable verdict all stop the run; it NEVER falls through to "approved".
+func (e *Engine) decideFromVerdict(state *core.State, stage workflows.Stage) bool {
+	iteration := state.Iterations[stage.Name]
+	v, err := e.store.LoadReviewVerdict(state.RunID, stage.Name, iteration)
+	if err != nil {
+		e.block(state, fmt.Sprintf("cannot read the persisted verdict for review stage %q (iteration %d) — refusing to transition without verifiable evidence", stage.Name, iteration))
+		return false
 	}
 
 	switch v.Status {
@@ -255,6 +370,12 @@ func (e *Engine) runGate(ctx context.Context, state *core.State, stage workflows
 	e.emit(state, stage.Name, "", core.EventGateStarted, map[string]any{"gate": name, "command": cmdStr})
 	state.NextAction = "gate: " + name
 	e.saveState(state)
+	// A gate can have real, non-idempotent effects (network, a build step). If announcing it
+	// did not persist, do NOT run it: a retry would re-run the whole operation, so an effect
+	// with no durable record of the attempt could happen twice.
+	if perr := e.persistFailed(); perr != nil {
+		return false, perr
+	}
 
 	// Track what the gate touches: a verification command should not mutate the
 	// tree (the backstop for gates that mutate via an interpreter the policy can't
@@ -384,6 +505,14 @@ func (e *Engine) trackMutations(state *core.State, stage workflows.Stage, worker
 	e.criticalWrite(e.store.SaveMutationReport(state.RunID, workerID, report), "save mutation report")
 	e.emit(state, stage.Name, workerID, core.EventMutationTracked, map[string]any{"count": len(muts)})
 	for _, m := range muts {
+		if m.HostBookkeeping {
+			// Not attributed to the worker, but not hidden either: this is the host's own
+			// permission allowlist, so a change here is worth seeing even when we don't block.
+			e.emit(state, stage.Name, workerID, "host_bookkeeping_mutation", map[string]any{
+				"path": m.Path, "hash": m.Hash,
+			})
+			continue
+		}
 		if m.OutOfScope {
 			e.emit(state, stage.Name, workerID, core.EventOutOfScopeMut, map[string]any{"path": m.Path})
 		}
@@ -416,42 +545,127 @@ func (e *Engine) checkGateMutations(state *core.State, stage string, n int, trac
 		Worker: fmt.Sprintf("gate:%s:%d", stage, n), Stage: stage,
 		BaseSHA: e.repo.BaseID(), Mutations: muts, CapturedAt: time.Now().UTC(),
 	}
-	e.warn(e.store.SaveGateMutationReport(state.RunID, stage, n, report), "save gate mutation report")
+	// The gate's mutation report is the PROMISED public audit of what the gate changed — it is
+	// must-succeed, not warn. If it does not persist, the run must not complete having recorded
+	// a gate_mutation event with no report behind it.
+	e.criticalWrite(e.store.SaveGateMutationReport(state.RunID, stage, n, report), "save gate mutation report")
 	e.emit(state, stage, "", "gate_mutation", map[string]any{"gate_n": n, "count": len(muts)})
 
 	if e.cfg.Security.GateMutations == "warn" {
 		return "", muts
 	}
-	// block mode: a gate that modifies or deletes an existing file (tracked or
-	// real untracked work) stops the run. New untracked files are recorded only.
+	// block mode: a gate that modifies or deletes a file that ALREADY EXISTED stops the
+	// run — tracked, untracked, or ignored, because none of those tell you the file is
+	// disposable. A file the gate genuinely CREATED is recorded and allowed through.
 	for _, m := range muts {
+		if gateOutputAllowed(m, e.cfg.Security.GateOutputs) {
+			continue
+		}
 		switch m.Kind {
 		case core.MutationDeleted:
-			return fmt.Sprintf("gate deleted %s — gates must only verify, not change the tree (security.gateMutations: block)", m.Path), muts
+			return fmt.Sprintf("gate deleted %s — gates must only verify, not change the tree%s", m.Path, gateOutputHint(m)), muts
 		case core.MutationModified:
-			return fmt.Sprintf("gate modified %s — gates must only verify, not change the tree (security.gateMutations: block)", m.Path), muts
+			return fmt.Sprintf("gate modified %s — gates must only verify, not change the tree%s", m.Path, gateOutputHint(m)), muts
 		}
 	}
 	return "", muts
+}
+
+// gateOutputAllowed reports a pre-existing file a gate may rewrite: one the project has
+// EXPLICITLY declared as a gate output in `security.gateOutputs`.
+//
+// It is declared and not inferred. The tempting shortcut is "the file is gitignored, so it
+// must be build output" — but an ignored file can just as easily be a private note, a
+// credential, a certificate, or a local config, and a global gitignore can make it a file
+// the project never mentioned at all. Guessing there means a gate can quietly overwrite
+// something irreplaceable. So the project says which paths are disposable, or none are.
+//
+// A sensitive path is never allowed, whatever the allowlist says: `.env` is gitignored
+// precisely because it holds secrets, and no gate has business rewriting it.
+func gateOutputAllowed(m core.Mutation, allowed []string) bool {
+	if m.Sensitive {
+		return false
+	}
+	return workspace.InScope(m.Path, allowed) && len(allowed) > 0
+}
+
+// gateOutputHint tells the user how to allow a path they *meant* their gate to write —
+// a coverage profile, a log — without which the message is just a wall.
+func gateOutputHint(m core.Mutation) string {
+	if m.Sensitive {
+		return " (security.gateMutations: block). This path is sensitive and cannot be allowlisted"
+	}
+	return fmt.Sprintf(" (security.gateMutations: block). If your gate is meant to write this, declare it:\n    security:\n      gateOutputs: [%q]", m.Path)
 }
 
 // mutationPolicyVerdict applies the security policy to a worker's mutations and
 // returns a blocking reason, or "" when the run may proceed. Pure function so
 // every branch is unit-testable.
 func mutationPolicyVerdict(stage workflows.Stage, muts []core.Mutation, sec config.SecurityConfig) string {
-	if stage.ReadOnly && len(muts) > 0 {
-		return fmt.Sprintf("stage %q is read-only but the worker modified %d file(s), starting with %s", stage.Name, len(muts), muts[0].Path)
+	// The coding host's machine-local permission file (settings.local.json) is the one
+	// mutation VichuFlow cannot attribute: the HOST rewrites it every time the user
+	// approves a command (normal, constant, and the agent touched nothing), and an AGENT
+	// could write it to grant itself tools (an escalation). On disk the two are identical
+	// — host-first means we do not launch the agent, so we cannot see which happened.
+	//
+	// So we do not pretend. `security.hostLocalState` decides, and the DEFAULT is warn:
+	// blocking by default would kill a run the first time the user clicks "approve",
+	// which is the bug that motivated all of this. Users who pre-authorize every command
+	// their agents need can set `block` and get the guarantee back. Either way the change
+	// is RECORDED with its hash and announced with its own event — the escalation cannot
+	// be silent, and it cannot fool the kernel, which still runs the gates itself.
+	//
+	// Everything else under .claude/ and .agents/ is a normal — and sensitive — mutation.
+	if hostState := hostLocalStateVerdict(muts, sec); hostState != "" {
+		return hostState
 	}
+	// HostBookkeeping is the ONLY exemption. Being ignored is not one: a read-only stage
+	// that mutated anything blocks, whatever your .gitignore says about the path. An
+	// ignored file can be a private note or a credential, and `security.gateOutputs` — the
+	// escape hatch for build output — is deliberately scoped to GATES, which is where the
+	// legitimate need is. A worker has no business rewriting your coverage file either.
+	attributed := make([]core.Mutation, 0, len(muts))
+	for _, m := range muts {
+		if !m.HostBookkeeping {
+			attributed = append(attributed, m)
+		}
+	}
+	if stage.ReadOnly && len(attributed) > 0 {
+		return fmt.Sprintf("stage %q is read-only but the worker modified %d file(s), starting with %s", stage.Name, len(attributed), attributed[0].Path)
+	}
+	return attributedMutationVerdict(attributed, sec)
+}
+
+// attributedMutationVerdict applies the sensitive / out-of-scope policy to the mutations
+// actually attributed to the worker (host bookkeeping already filtered out).
+func attributedMutationVerdict(muts []core.Mutation, sec config.SecurityConfig) string {
 	for _, m := range muts {
 		if m.Sensitive && sec.SensitiveMutations != "warn" {
 			return fmt.Sprintf("worker modified sensitive file %s (security.sensitiveMutations: block)", m.Path)
 		}
 	}
-	if sec.OutOfScopeMutations == "block" {
-		for _, m := range muts {
-			if m.OutOfScope {
-				return fmt.Sprintf("worker modified %s outside the stage's declared scope (security.outOfScopeMutations: block)", m.Path)
-			}
+	if sec.OutOfScopeMutations != "block" {
+		return ""
+	}
+	for _, m := range muts {
+		if m.OutOfScope {
+			return fmt.Sprintf("worker modified %s outside the stage's declared scope (security.outOfScopeMutations: block)", m.Path)
+		}
+	}
+	return ""
+}
+
+// hostLocalStateVerdict applies security.hostLocalState to a change in the coding host's
+// permission file. With `block`, ANY change stops the run — the setting exists precisely
+// for people who have pre-authorized what their agents need, so the file moving mid-run
+// means something they did not expect wrote it.
+func hostLocalStateVerdict(muts []core.Mutation, sec config.SecurityConfig) string {
+	if sec.HostLocalState != "block" {
+		return ""
+	}
+	for _, m := range muts {
+		if m.HostBookkeeping {
+			return fmt.Sprintf("the coding host's permission file %s changed during this worker — VichuFlow cannot tell whether the host wrote it (you approved a command) or the agent did (granting itself tools), so with security.hostLocalState: block it stops the run. Inspect the file, then `vichu run resume --accept-changes` if it was you", m.Path)
 		}
 	}
 	return ""
@@ -510,8 +724,19 @@ func addStageTokens(state *core.State, stage string, in, out int) {
 	if state.Budgets.StageTokensOut == nil {
 		state.Budgets.StageTokensOut = map[string]int{}
 	}
-	state.Budgets.StageTokensIn[stage] += in
-	state.Budgets.StageTokensOut[stage] += out
+	state.Budgets.StageTokensIn[stage] = addClamped(state.Budgets.StageTokensIn[stage], in)
+	state.Budgets.StageTokensOut[stage] = addClamped(state.Budgets.StageTokensOut[stage], out)
+}
+
+// addClamped adds without wrapping. Signed overflow in Go wraps to a large NEGATIVE
+// number, which would RESET a run's token budget to below zero — the one number a
+// runaway agent must never be able to reset. Saturating at MaxInt keeps every
+// `spent >= max` comparison true, so the cap holds.
+func addClamped(a, b int) int {
+	if b > 0 && a > math.MaxInt-b {
+		return math.MaxInt
+	}
+	return a + b
 }
 
 // accrueReportedUsage adds the cost/tokens a worker actually reported to the run
@@ -529,8 +754,8 @@ func (e *Engine) accrueReportedUsage(state *core.State, stageName, workerID stri
 		return
 	}
 	state.Budgets.TokensReported = true
-	state.Budgets.TokensInSpent += r.TokensIn
-	state.Budgets.TokensOutSpent += r.TokensOut
+	state.Budgets.TokensInSpent = addClamped(state.Budgets.TokensInSpent, r.TokensIn)
+	state.Budgets.TokensOutSpent = addClamped(state.Budgets.TokensOutSpent, r.TokensOut)
 	addStageTokens(state, stageName, r.TokensIn, r.TokensOut)
 	if r.TokensIn > 0 || r.TokensOut > 0 {
 		e.emit(state, stageName, workerID, "token_usage", map[string]any{
@@ -632,7 +857,48 @@ func (e *Engine) checkDrift(runID string, snap *core.Workspace) (bool, string) {
 	if err != nil {
 		return false, ""
 	}
-	return driftReason(current, e.expectedFingerprints(runID, snap))
+	expected := e.expectedFingerprints(runID, snap)
+	if p := legacySymlinkPath(snap, current, expected); p != "" {
+		return true, fmt.Sprintf("this run was started by an older VichuFlow that fingerprinted the symlink %s by following it and hashing the file it pointed at. "+
+			"It is now fingerprinted by its target TEXT, so the two cannot be compared and we will not guess whether the link changed. "+
+			"Review the diff, then resume with --accept-changes to re-baseline this run", p)
+	}
+	return driftReason(current, expected)
+}
+
+// legacySymlinkPath returns the first path whose persisted fingerprint cannot be compared
+// with the one we compute today, or "" when they are comparable.
+//
+// The symlink fingerprint format changed: older versions followed the link and hashed the
+// content it pointed at; a link is now hashed by its target text. A run snapshotted before
+// that has a bare hex hash where we now produce a "symlink:" one — which reads as drift and
+// blocked the run with "external modification", a message that is simply false. Nothing
+// external changed. Rather than read through the link to reconstruct the old value (which
+// is the escape this whole layer exists to prevent), the run is failed closed and told what
+// actually happened.
+func legacySymlinkPath(snap *core.Workspace, current, expected map[string]string) string {
+	if snap.FingerprintVersion == core.FingerprintSymlinkTarget {
+		return ""
+	}
+	for _, p := range sortedPaths(current) {
+		if !workspace.IsSymlinkFingerprint(current[p]) {
+			continue
+		}
+		if eh, ok := expected[p]; ok && !workspace.IsSymlinkFingerprint(eh) {
+			return p
+		}
+	}
+	return ""
+}
+
+// sortedPaths keeps the reported path stable when several would qualify.
+func sortedPaths(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for p := range m {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // expectedFingerprints is the working-tree state the run itself produced: the

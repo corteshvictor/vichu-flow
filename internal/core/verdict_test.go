@@ -85,3 +85,50 @@ func TestExtractVerdictObjectIgnoresBracesInStrings(t *testing.T) {
 		t.Fatalf("string-embedded braces broke extraction: ok=%v obj=%v", ok, obj)
 	}
 }
+
+// TestParseVerdictRejectsApprovedWithActionableFinding (ronda 18): "approved" cannot carry an
+// actionable (blocker/major) finding — that is a contradiction the kernel used to advance on. A
+// "minor" advisory note stays allowed.
+func TestParseVerdictRejectsApprovedWithActionableFinding(t *testing.T) {
+	for _, sev := range []string{"blocker", "major"} {
+		v := map[string]any{"status": "approved", "findings": []any{map[string]any{"severity": sev, "message": "fix X"}}}
+		if _, err := ParseVerdict(v); err == nil {
+			t.Fatalf("approved + %s finding must be rejected as contradictory", sev)
+		}
+	}
+	// approved + minor (advisory) is allowed.
+	if _, err := ParseVerdict(map[string]any{"status": "approved", "findings": []any{map[string]any{"severity": "minor", "message": "optional"}}}); err != nil {
+		t.Fatalf("approved + minor advisory must still be accepted: %v", err)
+	}
+	// needs_fixes + finding is the normal fix-loop path.
+	if _, err := ParseVerdict(map[string]any{"status": "needs_fixes", "findings": []any{map[string]any{"severity": "blocker", "message": "fix"}}}); err != nil {
+		t.Fatalf("needs_fixes + finding must be accepted: %v", err)
+	}
+}
+
+// TestParseVerdictRejectsIncoherentEnvelopes (ronda 22): the parser validates internal coherence,
+// not just the status name — else the kernel acts (blocks, loops, advances) on a self-contradictory
+// verdict.
+func TestParseVerdictRejectsIncoherentEnvelopes(t *testing.T) {
+	bad := []map[string]any{
+		{"status": "blocked"},     // no reason
+		{"status": "needs_fixes"}, // no findings
+		{"status": "needs_fixes", "findings": []any{map[string]any{"severity": "minor", "message": "x"}}},  // only minor
+		{"status": "approved", "findings": []any{map[string]any{"severity": "weird", "message": "x"}}},     // unknown severity
+		{"status": "needs_fixes", "findings": []any{map[string]any{"severity": "major", "message": "  "}}}, // empty message
+	}
+	for i, c := range bad {
+		if _, err := ParseVerdict(c); err == nil {
+			t.Fatalf("case %d must be rejected as incoherent: %v", i, c)
+		}
+	}
+	for _, ok := range []map[string]any{
+		{"status": "blocked", "summary": "unsafe task"},
+		{"status": "needs_fixes", "findings": []any{map[string]any{"severity": "major", "message": "fix"}}},
+		{"status": "approved", "findings": []any{map[string]any{"severity": "minor", "message": "polish"}}},
+	} {
+		if _, err := ParseVerdict(ok); err != nil {
+			t.Fatalf("coherent verdict must pass: %v (%v)", err, ok)
+		}
+	}
+}

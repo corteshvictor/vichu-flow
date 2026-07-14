@@ -1,6 +1,9 @@
 package core
 
-import "time"
+import (
+	"math"
+	"time"
+)
 
 // RunStatus is the lifecycle status of a run.
 type RunStatus string
@@ -60,14 +63,28 @@ type BudgetState struct {
 	StageTokensOut map[string]int `json:"stage_tokens_out,omitempty"`
 }
 
-// TokensTotalSpent is the sum of input and output tokens consumed by the run.
+// TokensTotalSpent is the sum of input and output tokens consumed by the run. It saturates:
+// the per-dimension counters already clamp at MaxInt, so a plain int add of two near-MaxInt
+// values would WRAP to a large negative — resetting the run's total below its cap, the one
+// number a runaway must never reset. saturatingAdd keeps `total >= max` true.
 func (b BudgetState) TokensTotalSpent() int {
-	return b.TokensInSpent + b.TokensOutSpent
+	return saturatingAdd(b.TokensInSpent, b.TokensOutSpent)
+}
+
+// saturatingAdd returns a+b, clamping at MaxInt/MinInt instead of wrapping on overflow.
+func saturatingAdd(a, b int) int {
+	if b > 0 && a > math.MaxInt-b {
+		return math.MaxInt
+	}
+	if b < 0 && a < math.MinInt-b {
+		return math.MinInt
+	}
+	return a + b
 }
 
 // StageTokensTotal is the total tokens (in + out) spent within a single stage.
 func (b BudgetState) StageTokensTotal(stage string) int {
-	return b.StageTokensIn[stage] + b.StageTokensOut[stage]
+	return saturatingAdd(b.StageTokensIn[stage], b.StageTokensOut[stage])
 }
 
 // State is the source of truth for a run, persisted atomically to state.json.
@@ -85,8 +102,24 @@ type State struct {
 	ActiveWorker  string                 `json:"active_worker,omitempty"`
 	BlockedReason string                 `json:"blocked_reason,omitempty"`
 	NextAction    string                 `json:"next_action,omitempty"`
-	CreatedAt     time.Time              `json:"created_at"`
-	UpdatedAt     time.Time              `json:"updated_at"`
+	// DriverTokenHash is the sha256 of the run's DRIVER TOKEN — the capability that says
+	// "I am the orchestrator of this run". Every command that MUTATES the run requires the
+	// token; `status` and `observe` do not, because reading is harmless.
+	//
+	// It exists because a host's permission rules are SESSION-WIDE. `Bash(vichu worker
+	// complete:*)` is authorized for the orchestrator, and therefore also for every subagent
+	// that has Bash — including the implementer, which needs it to run the project's tests.
+	// Without a capability, that implementer can close its OWN worker and then keep editing
+	// files: the audit stopped at the close, so the later changes are invisible and can never
+	// block the run. The permission layer cannot distinguish the two callers; the kernel can.
+	//
+	// Only the HASH is persisted. The token itself is returned once, to the orchestrator, and
+	// never written to `.vichu/` — so a subagent that can read the runtime still cannot drive
+	// the run. `run resume` (a human action) ROTATES it, which is what makes a leaked token
+	// recoverable.
+	DriverTokenHash string    `json:"driver_token_hash,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // Terminal reports whether the run has reached a state from which it will not

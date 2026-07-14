@@ -4,9 +4,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"sort"
 	"time"
 
+	"github.com/corteshvictor/vichu-flow/internal/config"
 	"github.com/corteshvictor/vichu-flow/internal/core"
 	"github.com/corteshvictor/vichu-flow/internal/i18n"
 	"github.com/corteshvictor/vichu-flow/internal/workflows"
@@ -67,6 +69,14 @@ func printStatusJSON(proj *project, runID string) error {
 	if err != nil {
 		return err
 	}
+	// A missing/corrupt audit must not be shown as an empty timeline — a host would read a lost
+	// history as "nothing happened". Fail; `doctor` is where you diagnose, `cancel` is the escape.
+	// LoadVerifiedEvents both proves the log coherent AND returns the SAME bytes recent_events renders,
+	// so status cannot validate one snapshot and then display a different re-read (a TOCTOU window).
+	events, verr := proj.store.LoadVerifiedEvents(runID)
+	if verr != nil {
+		return verr
+	}
 	out := map[string]any{
 		"run_id":         state.RunID,
 		"status":         string(state.Status),
@@ -78,12 +88,36 @@ func printStatusJSON(proj *project, runID string) error {
 		"next_action":    state.NextAction,
 		"budgets":        budgetsJSON(state.Budgets),
 	}
-	if lk, err := proj.store.InspectLock(runID); err == nil && lk.Present {
+	// InspectLock returns nil for a MISSING lock; any error here is a corrupt/unreadable one.
+	// Reporting present:false on a read error would tell the host that nobody holds the run when
+	// the kernel simply could not check — so fail instead of guessing.
+	lk, lerr := proj.store.InspectLock(runID)
+	if lerr != nil {
+		return fmt.Errorf("cannot read the run lock (%w) — status cannot confirm whether the run is held", lerr)
+	}
+	if lk.Present {
 		out["lock"] = map[string]any{"present": true, "orphaned": lk.Orphaned, "pid": lk.Lock.PID}
 	} else {
 		out["lock"] = map[string]any{"present": false}
 	}
-	out["recent_events"] = recentEventsJSON(proj, runID)
+	// The WORKSPACE provider (git|filesystem) — read from the run's FROZEN snapshot, not the
+	// current config — so a host can produce an accurate close ("no Git repo; mutations compared
+	// against the .vichu baseline" vs "working tree/commits"). Not to be confused with the workflow
+	// provider. A legacy run with NO snapshot is "unknown"; a corrupt/unreadable snapshot is a hard
+	// error (never inferred, never masked as "unknown").
+	switch ws, werr := proj.store.LoadWorkspace(runID); {
+	case errors.Is(werr, fs.ErrNotExist):
+		out["workspace_provider"] = "unknown" // legacy run without a snapshot
+	case werr != nil:
+		return fmt.Errorf("cannot read the workspace snapshot (%w) — status cannot report the provider", werr)
+	case ws.Provider == config.WorkspaceGit || ws.Provider == config.WorkspaceFilesystem:
+		out["workspace_provider"] = ws.Provider
+	default:
+		// A snapshot that parses but names a provider the runtime never produces is corrupt/forged;
+		// publishing it as valid state would let a host act on an impossible value.
+		return fmt.Errorf("workspace snapshot names an unknown provider %q (expected %s or %s)", ws.Provider, config.WorkspaceGit, config.WorkspaceFilesystem)
+	}
+	out["recent_events"] = recentEventsJSON(events)
 	return printJSON(out)
 }
 
@@ -121,11 +155,10 @@ func orderedStages(state *core.State) []map[string]string {
 	return out
 }
 
-func recentEventsJSON(proj *project, runID string) []map[string]any {
-	events, err := proj.store.ReadEvents(runID)
-	if err != nil {
-		return nil
-	}
+// recentEventsJSON renders the tail of an ALREADY-VERIFIED event slice (see LoadVerifiedEvents). It
+// takes the events rather than re-reading them so the JSON the host consumes is the same snapshot
+// status validated — no second read, no TOCTOU.
+func recentEventsJSON(events []core.Event) []map[string]any {
 	start := 0
 	if len(events) > 12 {
 		start = len(events) - 12
@@ -142,10 +175,22 @@ func printStatus(proj *project, runID string) error {
 	if err != nil {
 		return err
 	}
+	// A missing/corrupt audit is a hard error, not an empty timeline (see printStatusJSON). One read
+	// validates AND yields the timeline printed below — the check and the display are the same bytes.
+	events, verr := proj.store.LoadVerifiedEvents(runID)
+	if verr != nil {
+		return verr
+	}
 	printStateSummary(state)
 
-	// Surface an orphaned lock so the user knows the run can be resumed.
-	if lk, err := proj.store.InspectLock(runID); err == nil && lk.Present {
+	// Surface an orphaned lock so the user knows the run can be resumed. A corrupt/unreadable lock
+	// is a hard error (not "no lock"): InspectLock returns nil for a MISSING one, so any error here
+	// means we could not confirm whether the run is held — same rule as the --json path.
+	lk, lerr := proj.store.InspectLock(runID)
+	if lerr != nil {
+		return fmt.Errorf("cannot read the run lock (%w) — status cannot confirm whether the run is held", lerr)
+	}
+	if lk.Present {
 		if lk.Orphaned {
 			fmt.Printf("  "+i18n.T("status.lock_orphaned")+"\n", lk.Lock.PID, runID)
 		} else {
@@ -153,9 +198,9 @@ func printStatus(proj *project, runID string) error {
 		}
 	}
 
-	// Recent timeline.
-	events, err := proj.store.ReadEvents(runID)
-	if err == nil && len(events) > 0 {
+	// Recent timeline — from the SAME verified snapshot loaded above, so the human never reads
+	// "no recent events" over a broken log, nor a timeline different from what was validated.
+	if len(events) > 0 {
 		fmt.Println("\n  " + i18n.T("status.recent"))
 		start := 0
 		if len(events) > 8 {

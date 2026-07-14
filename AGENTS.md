@@ -52,7 +52,7 @@ macOS, and Windows. Keep dependencies minimal (one runtime dependency: `yaml.v3`
 
 ## Conventions
 
-- Go 1.26. Match the surrounding code's style, naming, and idioms.
+- Go 1.26.5+ (the floor is a security one: GO-2026-4970, an os.Root symlink escape, is fixed in 1.26.5 — the installer uses os.Root to confine its writes). Match the surrounding code's style, naming, and idioms.
 - The security policy is central (`internal/security`): it classifies dangerous
   commands before execution, and the agent tool-permission rules are generated
   from the same table — change the table, not the two outputs separately.

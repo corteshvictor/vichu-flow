@@ -124,7 +124,7 @@ func TestLockOrphanReclaimedByExpiredHeartbeat(t *testing.T) {
 		AcquiredAt:  time.Now().Add(-time.Hour),
 		HeartbeatAt: time.Now().Add(-time.Hour),
 	}
-	if err := writeJSON(s.lockPath("run-1"), &stale); err != nil {
+	if err := writeJSON(s.projectRoot, s.lockPath("run-1"), &stale); err != nil {
 		t.Fatal(err)
 	}
 	st, err := s.InspectLock("run-1")
@@ -181,7 +181,7 @@ func TestReleaseDoesNotDeleteReclaimedLock(t *testing.T) {
 		PID: os.Getpid(), Hostname: hostname(), RunID: "run-1",
 		Token: "other-owner-token", AcquiredAt: time.Now().UTC(), HeartbeatAt: time.Now().UTC(),
 	}
-	if err := writeJSON(s.lockPath("run-1"), &reclaimed); err != nil {
+	if err := writeJSON(s.projectRoot, s.lockPath("run-1"), &reclaimed); err != nil {
 		t.Fatal(err)
 	}
 	if err := h1.Release(); err != nil {
@@ -208,7 +208,7 @@ func TestHeartbeatReturnsLockLostOnReclaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	reclaimed := &core.Lock{RunID: "run-1", Token: "other-owner", HeartbeatAt: time.Now().UTC()}
-	if err := writeJSON(s.lockPath("run-1"), reclaimed); err != nil {
+	if err := writeJSON(s.projectRoot, s.lockPath("run-1"), reclaimed); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.Heartbeat(); !errors.Is(err, ErrLockLost) {
@@ -232,7 +232,7 @@ func TestStartHeartbeatSignalsLockLoss(t *testing.T) {
 		t.Fatal(err)
 	}
 	reclaimed := &core.Lock{RunID: "run-1", Token: "other-owner", HeartbeatAt: time.Now().UTC()}
-	if err := writeJSON(s.lockPath("run-1"), reclaimed); err != nil {
+	if err := writeJSON(s.projectRoot, s.lockPath("run-1"), reclaimed); err != nil {
 		t.Fatal(err)
 	}
 

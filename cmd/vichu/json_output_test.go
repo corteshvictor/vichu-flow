@@ -5,7 +5,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -14,8 +13,6 @@ import (
 )
 
 // reRunID extracts a run id from a command's human output ("Created run run-… ").
-var reRunID = regexp.MustCompile(`run-[0-9a-z-]+`)
-
 // captureStdout runs fn with os.Stdout redirected to a pipe and returns what was
 // written. Engine progress logs go to stderr (not captured), so this proves a
 // `--json` command emits ONLY the JSON object on stdout — the host-pack contract.
@@ -82,12 +79,8 @@ func TestStageCloseJSONIsPure(t *testing.T) {
 	// blocked verify close. The run id is parsed from `run start`'s output and used
 	// explicitly throughout — NOT resolved via LatestRun, which is ambiguous once a
 	// second run shares the same timestamp-second (the macOS-CI flake).
-	drive := func(task string, createFile bool) string {
-		out := captureStdout(t, func() { cli(cmdRunStart, "--workflow", "quick", task) })
-		rid := reRunID.FindString(out)
-		if rid == "" {
-			t.Fatalf("could not parse run id from run start output: %q", out)
-		}
+	drive := func(task string, createFile bool) (string, string) {
+		rid, tok := startRunWithToken(t, "--workflow", "quick", task)
 		// activeWorker resolves the worker from THIS run's state (explicit rid).
 		activeWorker := func() string {
 			st, err := store.LoadState(rid)
@@ -96,31 +89,31 @@ func TestStageCloseJSONIsPure(t *testing.T) {
 			}
 			return st.ActiveWorker
 		}
-		cli(cmdWorker, "start", "--run", rid, "--stage", "explore", "--role", "explorer")
-		cli(cmdWorker, "complete", "--run", rid, "--worker", activeWorker())
-		cli(cmdStage, "close", "--run", rid, "--stage", "explore")
-		cli(cmdWorker, "start", "--run", rid, "--stage", "implement", "--role", "implementer")
+		cli(cmdWorker, "start", "--run", rid, "--stage", "explore", "--role", "explorer", "--driver-token", tok)
+		cli(cmdWorker, "complete", "--run", rid, "--worker", activeWorker(), "--driver-token", tok)
+		cli(cmdStage, "close", "--run", rid, "--stage", "explore", "--driver-token", tok)
+		cli(cmdWorker, "start", "--run", rid, "--stage", "implement", "--role", "implementer", "--driver-token", tok)
 		if createFile {
 			mustWrite(t, feat, "package main\n")
 		} else {
 			_ = os.Remove(feat)
 		}
-		cli(cmdWorker, "complete", "--run", rid, "--worker", activeWorker())
-		cli(cmdStage, "close", "--run", rid, "--stage", "implement")
-		return rid
+		cli(cmdWorker, "complete", "--run", rid, "--worker", activeWorker(), "--driver-token", tok)
+		cli(cmdStage, "close", "--run", rid, "--stage", "implement", "--driver-token", tok)
+		return rid, tok
 	}
 
 	// --- blocked: the verify gate fails (no feature.go) ---
-	ridB := drive("blocked-run", false)
+	ridB, tokB := drive("blocked-run", false)
 	out := captureStdout(t, func() {
-		cli(cmdStage, "close", "--run", ridB, "--stage", "verify", "--json")
+		cli(cmdStage, "close", "--run", ridB, "--stage", "verify", "--json", "--driver-token", tokB)
 	})
 	assertPureJSON(t, out, "blocked")
 
 	// --- completed: the verify gate passes (feature.go present) ---
-	ridC := drive("ok-run", true)
+	ridC, tokC := drive("ok-run", true)
 	out = captureStdout(t, func() {
-		cli(cmdStage, "close", "--run", ridC, "--stage", "verify", "--json")
+		cli(cmdStage, "close", "--run", ridC, "--stage", "verify", "--json", "--driver-token", tokC)
 	})
 	assertPureJSON(t, out, "completed")
 }
@@ -153,4 +146,27 @@ func TestStatusFlagOrderBothWork(t *testing.T) {
 			t.Fatalf("status %v must print JSON regardless of flag order, got:\n%q", args, out)
 		}
 	}
+}
+
+// startRunWithToken runs `run start --json` and returns the run id and the DRIVER TOKEN,
+// exactly as a host pack's orchestrator would: the token is printed once and never written
+// to disk, so this is the only place to get it.
+func startRunWithToken(t *testing.T, args ...string) (runID, token string) {
+	t.Helper()
+	out := captureStdout(t, func() {
+		if err := cmdRunStart(append([]string{"--json"}, args...)); err != nil {
+			t.Fatalf("run start: %v", err)
+		}
+	})
+	var got struct {
+		RunID string `json:"run_id"`
+		Token string `json:"driver_token"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("run start --json: %v (%s)", err, out)
+	}
+	if got.Token == "" {
+		t.Fatal("run start must issue a driver token — without it the orchestrator cannot drive the run")
+	}
+	return got.RunID, got.Token
 }

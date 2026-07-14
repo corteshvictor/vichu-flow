@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -77,10 +78,56 @@ func ParseVerdict(data map[string]any) (Verdict, error) {
 	if err := json.Unmarshal(raw, &v); err != nil {
 		return Verdict{}, fmt.Errorf("parsing reviewer verdict: %w", err)
 	}
-	if !v.Status.Valid() {
-		return Verdict{}, fmt.Errorf("reviewer verdict has invalid status %q (want approved|needs_fixes|blocked)", v.Status)
+	if err := ValidateVerdict(v); err != nil {
+		return Verdict{}, err
 	}
 	return v, nil
+}
+
+// ValidateVerdict (exported) rejects an envelope whose status contradicts its findings — a verdict the
+// kernel would otherwise ACT on (block, advance, run a fix loop) while its own contents say something
+// different. Each rule closes a concrete false-success:
+//   - every finding needs a real severity and a non-empty message (an empty finding is no evidence);
+//   - "blocked" needs a reason, or the run blocks with "reviewer blocked the run: " (empty);
+//   - "needs_fixes" needs at least one actionable (blocker/major) finding, or the fix loop runs with
+//     nothing to fix;
+//   - "approved" may carry only "minor" advisory notes — a blocker/major means it is NOT approved.
+//
+// It also rejects an UNKNOWN status. This is the single validator ParseVerdict AND LoadReviewVerdict
+// (persisted evidence) delegate to — so a persisted `{"status":"maybe"}` cannot load and then be
+// presented by decideFromVerdict's default as a "reviewer blocked" the reviewer never issued.
+func ValidateVerdict(v Verdict) error {
+	if !v.Status.Valid() {
+		return fmt.Errorf("reviewer verdict has invalid status %q (want approved|needs_fixes|blocked)", v.Status)
+	}
+	actionable := 0
+	for i, f := range v.Findings {
+		switch f.Severity {
+		case SeverityBlocker, SeverityMajor:
+			actionable++
+		case SeverityMinor:
+		default:
+			return fmt.Errorf("reviewer finding #%d has an unknown severity %q (want blocker|major|minor)", i+1, f.Severity)
+		}
+		if strings.TrimSpace(f.Message) == "" {
+			return fmt.Errorf("reviewer finding #%d (%s) has an empty message — a finding must say what it is", i+1, f.Severity)
+		}
+	}
+	switch v.Status {
+	case VerdictApproved:
+		if actionable > 0 {
+			return fmt.Errorf("reviewer verdict is 'approved' but carries an actionable (blocker/major) finding — an approved review cannot have a defect; use 'needs_fixes' so the fix loop runs")
+		}
+	case VerdictNeedsFixes:
+		if actionable == 0 {
+			return errors.New("reviewer verdict is 'needs_fixes' but has no actionable (blocker/major) finding — the fix loop would run with nothing to fix")
+		}
+	case VerdictBlocked:
+		if strings.TrimSpace(v.Summary) == "" {
+			return errors.New("reviewer verdict is 'blocked' but gives no reason (empty summary) — a block must say why the task cannot proceed")
+		}
+	}
+	return nil
 }
 
 // ParseVerdictFromResult extracts a validated Verdict from a worker result.

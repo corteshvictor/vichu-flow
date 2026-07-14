@@ -14,6 +14,8 @@ import (
 func cmdUninstall(args []string) error {
 	fs := flag.NewFlagSet("uninstall", flag.ContinueOnError)
 	host := fs.String("host", "", i18n.T("init.flag_host"))
+	withdraw := fs.Bool("withdraw-permissions", false, i18n.T("uninstall.flag_withdraw"))
+	force := fs.Bool("force", false, i18n.T("uninstall.flag_force"))
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -30,7 +32,7 @@ func cmdUninstall(args []string) error {
 		root = cwd
 	}
 
-	removed, kept, err := uninstallHostPack(root, *host)
+	removed, kept, err := uninstallHostPack(root, *host, *withdraw, *force)
 	if err != nil {
 		return err
 	}

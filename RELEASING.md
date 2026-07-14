@@ -45,3 +45,40 @@ Homebrew, Scoop, and winget publishing is pre-wired but commented out in
   also needs a token.
 
 Binaries on the GitHub Release work on every OS without any of this.
+
+## Before changing a host pack: record the last release
+
+`vichu init --host` and `vichu uninstall` decide whether a file is *ours* by comparing its
+bytes against the pack this binary ships **and every version we ever released**. That history
+lives in two places, and both must be updated **before** you change a pack file:
+
+1. `internal/hostpacks/packs/<host>/known-hashes.json` — the sha256 of each file, per release.
+   Compiled into the binary; the only reference a cloned repo cannot forge.
+2. `cmd/vichu/testdata/packs/<host>/<tag>/` — the released files themselves, checked in.
+
+Skip this and the failure is silent and nasty: a user's untouched pack from the last release
+stops looking like ours, so `vichu doctor` tells them to refresh — and the refresh **refuses**.
+The upgrade path dead-ends. That happened once; three tests now make sure it cannot happen
+again.
+
+```bash
+git fetch --tags
+go run ./tools/packhistory --host claude-code --tag v0.4.0   # writes catalog + fixtures
+go test ./cmd/vichu/ -run 'TestKnownHashesCatalogIsTruthful|TestEveryReleasedPackIsRecorded'
+```
+
+Then, and only then, edit the pack.
+
+> **Do not do this with `git show --name-only <tag>`.** That lists what the *tagged commit*
+> changed — and a release-please tag commit only touches the version and the changelog, so it
+> enumerates the pack **zero times**. The pack must be read from the tag's **tree**, and the
+> manifest *at that tag* is the only thing that knows which files the pack had. `packhistory`
+> does exactly that; a shell one-liner quietly does not.
+
+**What guards this:**
+
+| Test | Catches |
+|---|---|
+| `TestKnownHashesCatalogIsTruthful` | catalog and fixtures disagree (a hash with no file, a file with no hash) |
+| `TestEveryReleasedPackIsRecorded` | a whole release never recorded — the case the gate above is blind to, because both sides would simply be missing it |
+| `TestUpgradeFromAReleasedPackNeedsNoForce` | an untouched pack from a past release still upgrades without `--force` |

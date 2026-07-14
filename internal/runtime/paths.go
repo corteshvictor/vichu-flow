@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -47,11 +48,54 @@ func (s *Store) RunsDir() string { return filepath.Join(s.root, "runs") }
 // RunDir is .vichu/runs/<run-id>.
 func (s *Store) RunDir(runID string) string { return filepath.Join(s.RunsDir(), runID) }
 
+// ValidateRunID rejects a run id that is not a single, safe path component. The id is joined onto
+// .vichu/runs to build EVERY path for the run, so a value carrying a path separator, "." / "..", an
+// absolute path, a Windows volume or UNC prefix, a control character, or that is empty or over-long
+// could resolve OUTSIDE .vichu/runs — a run operation reading or writing another location in the
+// project (confinement only keeps paths inside the PROJECT, not inside the runs directory). This is
+// the check that keeps a run scoped to its own directory, so it must run BEFORE any path is built, any
+// lock is taken, or anything is read or written. It deliberately does NOT require a "run-" prefix:
+// ids minted by older versions and hand-created runs stay valid, so no migration is needed.
+func ValidateRunID(runID string) error {
+	switch {
+	case runID == "":
+		return fmt.Errorf("run id is empty")
+	case len(runID) > 128:
+		return fmt.Errorf("run id is too long (%d chars, max 128)", len(runID))
+	case runID == "." || runID == "..":
+		return fmt.Errorf("run id %q is not a valid run directory name", runID)
+	case strings.ContainsAny(runID, `/\`):
+		return fmt.Errorf("run id %q must not contain a path separator", runID)
+	case filepath.IsAbs(runID) || filepath.VolumeName(runID) != "":
+		return fmt.Errorf("run id %q must be a single relative component, not an absolute or volume path", runID)
+	}
+	for _, r := range runID {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("run id contains a control character (0x%02x)", r)
+		}
+	}
+	return nil
+}
+
 func (s *Store) statePath(runID string) string { return filepath.Join(s.RunDir(runID), "state.json") }
 func (s *Store) eventsPath(runID string) string {
 	return filepath.Join(s.RunDir(runID), "events.ndjson")
 }
-func (s *Store) lockPath(runID string) string { return filepath.Join(s.RunDir(runID), "lock.json") }
+
+// HostPackScope is the reserved lock scope for host-pack install/uninstall. It is not a
+// run id — those are timestamped (`run-…`) — so it can never collide with one. The lock is
+// PROJECT-wide, not per-run, because two `vichu init --host` processes edit the same
+// `.claude/settings.json`: without it they read the same allow-list, each append their
+// rules, and the last write wins, silently dropping the other's.
+const HostPackScope = "hostpack"
+
+// lockPath is the lock file for a scope: a run, or the project-wide host-pack scope.
+func (s *Store) lockPath(scope string) string {
+	if scope == HostPackScope {
+		return filepath.Join(s.root, "hostpack.lock.json")
+	}
+	return filepath.Join(s.RunDir(scope), "lock.json")
+}
 
 func (s *Store) workspacePath(runID string) string {
 	return filepath.Join(s.RunDir(runID), "workspace.json")
@@ -92,9 +136,15 @@ func (s *Store) ArtifactsDir(runID string) string {
 	return filepath.Join(s.RunDir(runID), "artifacts")
 }
 
-// NewRunID builds a sortable, unique run id of the form run-YYYYMMDD-HHMMSS-xxxx.
+// NewRunID builds a sortable, unique run id of the form run-YYYYMMDD-HHMMSS-xxxxxxxxxxxx.
+//
+// The random suffix is 6 bytes (48 bits), not 2. Two run starts in the same wall-clock
+// second collide with birthday probability over the suffix space, and a 16-bit suffix put
+// that at ~50% around 300 concurrent starts/second — at which point CreateRun silently
+// overwrote the first run's state. 48 bits makes it negligible; CreateRun also now refuses
+// an id that already exists, so a collision fails loudly instead of clobbering.
 func NewRunID(now time.Time) string {
-	return fmt.Sprintf("run-%s-%s", now.UTC().Format("20060102-150405"), randSuffix(2))
+	return fmt.Sprintf("run-%s-%s", now.UTC().Format("20060102-150405"), randSuffix(6))
 }
 
 func randSuffix(n int) string {

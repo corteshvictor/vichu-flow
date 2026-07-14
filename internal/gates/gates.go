@@ -53,7 +53,7 @@ func (r *Runner) Run(ctx context.Context, runID, stage string, n int, spec Spec)
 	}
 
 	outPath := r.store.GateOutputPath(runID, stage, n)
-	out, err := os.Create(outPath)
+	out, err := r.store.CreateGateOutput(runID, stage, n)
 	if err != nil {
 		return nil, err
 	}

@@ -257,3 +257,75 @@ func TestResumeReclaimsOrphanedLock(t *testing.T) {
 		t.Fatalf("resume must reclaim an orphaned lock, got %v", err)
 	}
 }
+
+// TestHeadlessResumeBlocksOnCorruptAudit (ronda 24): the headless Engine.Resume — not just the
+// host-first ReopenRun — must validate the audit under the lock before running the loop. A `{}` log
+// (parses, but is not run_created) is caught by ValidateEventLog yet tolerated by ReadEvents, so
+// without the check resume would proceed on an unreadable history. Fail closed.
+func TestHeadlessResumeBlocksOnCorruptAudit(t *testing.T) {
+	dir := newTestRepo(t)
+	e, _, store := blockedRunEngine(t, dir)
+
+	state, err := e.Start(context.Background(), "task", "quick")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if state.Status != core.StatusBlocked {
+		t.Fatalf("expected a blocked run to resume, got %s", state.Status)
+	}
+	// Replace the audit with a parseable-but-incoherent log (no run_created). ReadEvents tolerates
+	// it; ValidateEventLog does not — so a failure here comes from the new validation, not a re-run.
+	ev := filepath.Join(store.RunDir(state.RunID), "events.ndjson")
+	if err := os.WriteFile(ev, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, rerr := e.Resume(context.Background(), state.RunID, ResumeOptions{}); rerr == nil {
+		t.Fatal("headless resume must fail on a corrupt audit")
+	}
+}
+
+// TestResumeEmitsNoEventWhenSnapshotWriteFails: a resume whose new config snapshot cannot be
+// written must return an error and leave NO run_resumed event — the audit must not claim a
+// resume the command reported as failed.
+func TestResumeEmitsNoEventWhenSnapshotWriteFails(t *testing.T) {
+	dir := newTestRepo(t)
+	store := rt.Open(dir)
+	repo, _ := workspace.Detect(dir)
+
+	cfg := config.Default()
+	cfg.Workspace.RequireCleanTree = "allow"
+	cfg.Commands = map[string]config.OSCommand{"test": failingGate()} // block after implement
+
+	reg := adapters.NewRegistry()
+	reg.Register(adapters.FakeName, func() (adapters.Adapter, error) { return adapters.NewFake(adapters.FakeScript{}), nil })
+	e := New(Options{Store: store, Registry: reg, Config: cfg, Repo: repo})
+
+	state, err := e.Start(context.Background(), "task", "quick")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if state.Status != core.StatusBlocked {
+		t.Fatalf("expected blocked, got %s", state.Status)
+	}
+	runID := state.RunID
+
+	// Make the snapshot path un-writable: replace it with a NON-EMPTY directory (a rename over
+	// it cannot succeed). Portable — no POSIX permission tricks.
+	snapPath := store.ConfigSnapshotPath(runID)
+	if err := os.Remove(snapPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(snapPath, "blocker"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeEv, _ := store.ReadEvents(runID)
+	before := countEvent(beforeEv, core.EventRunResumed)
+	if _, rerr := e.Resume(context.Background(), runID, ResumeOptions{}); rerr == nil {
+		t.Fatal("resume must fail when the snapshot cannot be written")
+	}
+	afterEv, _ := store.ReadEvents(runID)
+	if after := countEvent(afterEv, core.EventRunResumed); after != before {
+		t.Fatalf("a run_resumed event was written for a resume that failed (%d → %d)", before, after)
+	}
+}

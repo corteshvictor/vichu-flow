@@ -97,10 +97,15 @@ func cmdRunStart(args []string) error {
 	taskFlag := fs.String("task", "", i18n.T("run.flag_task"))
 	opID := fs.String("op-id", "", i18n.T("op.flag_id"))
 	jsonOut := fs.Bool("json", false, i18n.T("run.flag_json"))
-	if err := fs.Parse(args); err != nil {
+	// parseArgsAnyOrder, NOT plain fs.Parse: the task is a positional, and Go's flag package
+	// stops parsing at the first positional — so `run start "task" --op-id X` would silently
+	// drop --op-id, and a retry that lost its idempotency key creates a DUPLICATE run doing
+	// the work twice. Accept flags on either side of the task.
+	positionals, err := parseArgsAnyOrder(fs, args)
+	if err != nil {
 		return err
 	}
-	positional := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	positional := strings.TrimSpace(strings.Join(positionals, " "))
 	if *taskFlag != "" && positional != "" {
 		return errors.New(i18n.T("run.task_both"))
 	}
@@ -120,19 +125,25 @@ func cmdRunStart(args []string) error {
 		return err
 	}
 
-	state, err := proj.engineForOutput(*jsonOut).StartRun(task, *workflow, *opID)
+	state, token, err := proj.engineForOutput(*jsonOut).StartRun(task, *workflow, *opID)
 	if err != nil {
 		return err
 	}
 
+	// The driver token is printed ONCE, here, and never written under .vichu/. Only its
+	// hash is persisted, so a subagent that can read the runtime cannot drive the run.
 	if *jsonOut {
 		return printJSON(map[string]string{
-			"run_id": state.RunID,
-			"status": string(state.Status),
-			"stage":  state.CurrentStage,
+			"run_id":       state.RunID,
+			"status":       string(state.Status),
+			"stage":        state.CurrentStage,
+			"driver_token": token,
 		})
 	}
 	fmt.Printf(i18n.T("run.started")+"\n", state.RunID, state.CurrentStage)
+	if token != "" {
+		fmt.Printf("\n"+i18n.T("run.driver_token")+"\n", token)
+	}
 	return nil
 }
 

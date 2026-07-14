@@ -36,7 +36,7 @@ func (r *Repo) Root() string { return r.root }
 func (r *Repo) Kind() string { return KindGit }
 
 // ResumeTracking reconstructs a Tracker from a persisted before-snapshot.
-func (r *Repo) ResumeTracking(before map[string]core.FileSig) *Tracker {
+func (r *Repo) ResumeTracking(before map[string]core.FileSig) (*Tracker, error) {
 	return resumeTracker(r, before)
 }
 
@@ -61,13 +61,14 @@ func (r *Repo) Snapshot(isolation string) (*core.Workspace, error) {
 	}
 	sort.Strings(dirty)
 	return &core.Workspace{
-		Provider:     KindGit,
-		Isolation:    isolation,
-		Branch:       branch,
-		BaseSHA:      base,
-		DirtyFiles:   dirty,
-		Fingerprints: prints,
-		CapturedAt:   time.Now().UTC(),
+		Provider:           KindGit,
+		Isolation:          isolation,
+		Branch:             branch,
+		BaseSHA:            base,
+		DirtyFiles:         dirty,
+		Fingerprints:       prints,
+		FingerprintVersion: core.FingerprintSymlinkTarget,
+		CapturedAt:         time.Now().UTC(),
 	}, nil
 }
 
@@ -143,21 +144,18 @@ func (r *Repo) DirtyPaths() ([]string, error) {
 	return r.dirtyPaths()
 }
 
-// dirtyPaths returns the sorted set of paths reported by git status.
+// dirtyPaths returns the sorted set of paths that differ from the baseline. It reads the
+// SAME capture the tracker diffs against — there is one status parser in this package, on
+// purpose. Two parsers meant two answers about what counts as changed, and the one here
+// used to split porcelain lines by hand: it kept git's C-escaping, so a path with an
+// accent in it was reported under a name that does not exist on disk.
 func (r *Repo) dirtyPaths() ([]string, error) {
-	out, err := r.git("status", "--porcelain=v1", "--untracked-files=all")
+	changed, err := r.captureChanged()
 	if err != nil {
 		return nil, err
 	}
-	var paths []string
-	for _, line := range strings.Split(out, "\n") {
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		p := parsePorcelainPath(line)
-		if isRuntimePath(p) {
-			continue
-		}
+	paths := make([]string, 0, len(changed))
+	for p := range changed {
 		paths = append(paths, p)
 	}
 	sort.Strings(paths)

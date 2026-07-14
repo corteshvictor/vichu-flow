@@ -26,7 +26,7 @@ it, and put `vichu` on your `PATH`. Verify:
 vichu version
 ```
 
-> Prefer to build from source? With Go 1.26+:
+> Prefer to build from source? You need **Go 1.26.5+** for that (the released binaries need no Go):
 > `go install github.com/corteshvictor/vichu-flow/cmd/vichu@latest`
 > (or clone and `go build -o vichu ./cmd/vichu`). See the
 > [README](../../README.md#install) for all install options.
@@ -51,11 +51,17 @@ vichu doctor
 
 ## 3. Drive a run from your agent (host-first)
 
-Open Claude Code in the repo and talk to it:
+Open Claude Code in the repo and start your request with `/vichu`:
 
 ```
-implement a greeting function using sdd
+/vichu implement a greeting function using sdd
 ```
+
+`/vichu` is the reliable entry point — it loads the orchestrator explicitly. Plain
+natural language ("implement a greeting function") may or may not reach the
+orchestrator: whether a skill auto-activates is the host's call, not ours, so a run
+you start that way can quietly turn into an ordinary, unverified edit. Type the
+slash command and you always get the verified run.
 
 The orchestrator classifies the request, picks a workflow, and drives a **verified
 run**: it delegates the coding to native subagents and calls the `vichu` kernel
@@ -142,6 +148,22 @@ vichu exec resume <run-id> --accept-changes       # re-baseline and continue hea
 ```
 
 The re-baseline is recorded in the run's timeline (`workspace_rebaselined`).
+
+## Known limits
+
+Worth knowing before you lean on it — these are real and are being fixed:
+
+- **One run per folder at a time.** Two runs share the same files; on the `filesystem`
+  provider a second run re-baselines the tree, and a change the first run's worker made can
+  stop looking like a mutation. Finish or `vichu cancel` a run before starting another there.
+- **One process per run.** The run lock is a heartbeat lease, not an OS lock: a process
+  stalled for 30s (suspended laptop, slow network filesystem, antivirus) can look abandoned.
+  Avoid NFS.
+- **Refreshing the host pack during a live run** rewrites `.claude/`, which the run sees as
+  workspace drift. Finish your runs first — see [Upgrading](upgrading.md).
+
+What holds regardless: a run reaches `completed` **only** when the kernel ran your gates
+itself and they passed.
 
 ## Next steps
 

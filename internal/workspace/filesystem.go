@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -47,8 +48,9 @@ func (w *FilesystemWorkspace) Root() string { return w.root }
 // Kind names this backend; it satisfies Provider.Kind.
 func (w *FilesystemWorkspace) Kind() string { return KindFilesystem }
 
-// ResumeTracking reconstructs a Tracker from a persisted before-snapshot.
-func (w *FilesystemWorkspace) ResumeTracking(before map[string]core.FileSig) *Tracker {
+// ResumeTracking reconstructs a Tracker from a persisted before-snapshot. It fails on a
+// snapshot whose recorded state is ambiguous rather than guess — see resumeTracker.
+func (w *FilesystemWorkspace) ResumeTracking(before map[string]core.FileSig) (*Tracker, error) {
 	return resumeTracker(w, before)
 }
 
@@ -74,19 +76,27 @@ func (w *FilesystemWorkspace) Snapshot(isolation string) (*core.Workspace, error
 		return nil, err
 	}
 	return &core.Workspace{
-		Provider:     KindFilesystem,
-		Isolation:    isolation,
-		Branch:       "",
-		BaseSHA:      id,
-		DirtyFiles:   nil,
-		Fingerprints: map[string]string{},
-		CapturedAt:   time.Now().UTC(),
+		Provider:           KindFilesystem,
+		Isolation:          isolation,
+		Branch:             "",
+		BaseSHA:            id,
+		DirtyFiles:         nil,
+		Fingerprints:       map[string]string{},
+		FingerprintVersion: core.FingerprintSymlinkTarget,
+		CapturedAt:         time.Now().UTC(),
 	}, nil
 }
 
 // rebaseline clears the baseline copy, copies the current tree into it
 // (excluding .git and the .vichu runtime), and persists the manifest and id.
 func (w *FilesystemWorkspace) rebaseline() (string, error) {
+	// .vichu must be a real directory before we RemoveAll anything under it: os.RemoveAll
+	// follows a symlinked PARENT component, so a `.vichu` symlink pointing outside the project
+	// would make `RemoveAll(.vichu/baseline)` delete external data. This is the single guard
+	// that protects the run's whole runtime dir from a planted `.vichu` symlink.
+	if err := ensureRealRuntimeDir(w.root); err != nil {
+		return "", err
+	}
 	base := w.baselinePath()
 	if err := os.RemoveAll(base); err != nil {
 		return "", err
@@ -110,11 +120,11 @@ func (w *FilesystemWorkspace) rebaseline() (string, error) {
 	if err := os.MkdirAll(filepath.Join(w.root, runtimeDirName), 0o755); err != nil {
 		return "", err
 	}
-	if err := writeManifest(w.manifestPath(), manifest); err != nil {
+	if err := writeManifest(w.root, w.manifestPath(), manifest); err != nil {
 		return "", err
 	}
 	id := manifestID(manifest)
-	if err := os.WriteFile(w.baseIDPath(), []byte(id), 0o644); err != nil {
+	if err := writeConfinedAtomic(w.root, w.baseIDPath(), []byte(id), 0o644); err != nil {
 		return "", err
 	}
 	return id, nil
@@ -148,22 +158,52 @@ func (w *FilesystemWorkspace) RestoreBaseline(paths []string) (int, error) {
 	if len(paths) == 0 {
 		return 0, nil
 	}
+	// Confined, and never through a symlink: if what sits at p is now a link (a gate can
+	// put one there), os.WriteFile would follow it and write the baseline content into
+	// whatever it points at — possibly outside the project. writeEntry removes it first.
+	root, err := openRoot(w.root)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = root.Close() }()
+
+	// The baseline copy is read through its OWN confined root, for the same reason: .vichu/
+	// is agent-writable, so an agent could plant .vichu/baseline/p as a symlink and make a
+	// plain os.ReadFile pull external content INTO the restore.
 	base := w.baselinePath()
+	baseRoot, berr := openRoot(base)
+	if errors.Is(berr, fs.ErrNotExist) {
+		return 0, nil // no baseline dir at all → every path is a file the run added
+	}
+	if berr != nil {
+		return 0, berr
+	}
+	defer func() { _ = baseRoot.Close() }()
+
 	restored := 0
 	for _, p := range paths {
-		src := filepath.Join(base, filepath.FromSlash(p))
-		data, err := os.ReadFile(src)
-		if err != nil {
-			continue // not in baseline — a file the run added; nothing to restore
+		src, rerr := readEntry(baseRoot, p)
+		if rerr != nil {
+			// The baseline copy EXISTS but cannot be read — an I/O fault, a permission
+			// change, or the entry replaced by something we refuse to follow. We cannot
+			// honestly restore p, so fail loudly. Swallowing this as "not in baseline"
+			// was the canonical bug: rollbackGate would then emit gate_rolled_back while
+			// p stayed destroyed. Only a genuinely absent copy means "the run added it".
+			return restored, fmt.Errorf("cannot read baseline copy of %s: %w", p, rerr)
 		}
-		dst := filepath.Join(w.root, filepath.FromSlash(p))
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			return restored, err
+		switch src.kind {
+		case entryMissing:
+			continue // p was not in the baseline — a file the run added; nothing to restore
+		case entryRegular:
+			if werr := writeEntry(root, p, src); werr != nil {
+				return restored, werr
+			}
+			restored++
+		default:
+			// The baseline holds only regular files (copyFileHash writes them). Anything
+			// else is tampering, and we will not turn a symlink's target text into content.
+			return restored, fmt.Errorf("baseline copy of %s is not a regular file", p)
 		}
-		if err := os.WriteFile(dst, data, fileMode(src)); err != nil {
-			return restored, err
-		}
-		restored++
 	}
 	return restored, nil
 }
@@ -185,16 +225,28 @@ func (w *FilesystemWorkspace) captureChanged() (map[string]changedFile, error) {
 	if err != nil {
 		return nil, err
 	}
+	root, err := openRoot(w.root)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = root.Close() }()
+
 	changed := map[string]changedFile{}
 	seen := map[string]bool{}
-	walkErr := w.walkFiles(func(rel, full string) error {
+	walkErr := w.walkFiles(func(rel, _ string) error {
 		seen[rel] = true
-		h := hashFile(full)
+		h, e, herr := hashEntry(root, rel)
+		if herr != nil {
+			return herr // a file we cannot read is not a file we can audit or restore
+		}
+		cf := changedFile{hash: h, exists: e.kind != entryMissing, mode: e.mode}
 		switch base, ok := baseManifest[rel]; {
 		case !ok:
-			changed[rel] = changedFile{code: "??", hash: h}
+			cf.code = "??"
+			changed[rel] = cf
 		case base != h:
-			changed[rel] = changedFile{code: " M", hash: h}
+			cf.code = " M"
+			changed[rel] = cf
 		}
 		return nil
 	})
@@ -221,32 +273,44 @@ func (w *FilesystemWorkspace) lineStats(path string, untracked bool) (added, del
 	return lineDelta(oldData, newData)
 }
 
-// walkFiles visits every regular file under the workspace root, skipping the
-// .git and .vichu directories. Paths passed to fn are forward-slash relative.
+// walkFiles visits every regular file under the workspace root, skipping tooling
+// state (.git, .vichu, the host's local config). Paths passed to fn are
+// forward-slash relative.
 func (w *FilesystemWorkspace) walkFiles(fn func(rel, full string) error) error {
 	return filepath.WalkDir(w.root, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if p == w.root {
-			return nil
-		}
-		rel, rerr := filepath.Rel(w.root, p)
-		if rerr != nil {
-			return rerr
-		}
-		rel = filepath.ToSlash(rel)
-		if d.IsDir() {
-			if rel == ".git" || rel == runtimeDirName {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !d.Type().IsRegular() {
-			return nil // skip symlinks, sockets, devices
-		}
-		return fn(rel, p)
+		return w.visitEntry(p, d, err, fn)
 	})
+}
+
+// visitEntry decides what the walk does with one entry: propagate errors, skip the
+// directories and tooling state that are never workspace content, and hand every
+// remaining regular file to fn.
+func (w *FilesystemWorkspace) visitEntry(p string, d fs.DirEntry, err error, fn func(rel, full string) error) error {
+	if err != nil || p == w.root {
+		return err // nil at the root; a real error otherwise
+	}
+	rel, rerr := filepath.Rel(w.root, p)
+	if rerr != nil {
+		return rerr
+	}
+	rel = filepath.ToSlash(rel)
+	if d.IsDir() {
+		if rel == ".git" || rel == runtimeDirName {
+			return filepath.SkipDir // VCS internals and VichuFlow's own runtime
+		}
+		return nil
+	}
+	// Skip what is not workspace content: symlinks/sockets/devices, and tooling state
+	// — the host's machine-local config (e.g. .claude/settings.local.json) is its own
+	// bookkeeping, not the agent's work, so keep it out of the baseline AND the diff.
+	// Otherwise approving a command mid-run looks like a worker mutation.
+	// Host-local state is walked like any other file: it is recorded as evidence and
+	// only exempted from the mutation POLICY later (core.Mutation.HostBookkeeping).
+	// Skipping it here would erase it from the audit entirely.
+	if !d.Type().IsRegular() || isRuntimePath(rel) {
+		return nil
+	}
+	return fn(rel, p)
 }
 
 // copyFileHash copies src to dst (preserving permission bits) and returns the
@@ -284,7 +348,7 @@ func manifestID(m map[string]string) string {
 }
 
 // writeManifest persists a path→hash manifest as "hash\tpath" lines.
-func writeManifest(path string, m map[string]string) error {
+func writeManifest(root, path string, m map[string]string) error {
 	var b strings.Builder
 	for _, k := range sortedKeys(m) {
 		b.WriteString(m[k])
@@ -292,7 +356,7 @@ func writeManifest(path string, m map[string]string) error {
 		b.WriteString(k)
 		b.WriteByte('\n')
 	}
-	return os.WriteFile(path, []byte(b.String()), 0o644)
+	return writeConfinedAtomic(root, path, []byte(b.String()), 0o644)
 }
 
 // readManifest loads a manifest written by writeManifest. A missing manifest is

@@ -33,6 +33,7 @@ func cmdStageClose(args []string) error {
 	run := fs.String("run", "", i18n.T("worker.flag_run"))
 	stage := fs.String("stage", "", i18n.T("worker.flag_stage"))
 	opID := fs.String("op-id", "", i18n.T("op.flag_id"))
+	tokenR := driverTokenFlags(fs)
 	jsonOut := fs.Bool("json", false, i18n.T("run.flag_json"))
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -40,12 +41,16 @@ func cmdStageClose(args []string) error {
 	if *run == "" || *stage == "" {
 		return errors.New(i18n.T("stage.need_close_flags"))
 	}
+	token, err := tokenR.resolve(false)
+	if err != nil {
+		return err
+	}
 
 	proj, err := openWorkerProject()
 	if err != nil {
 		return err
 	}
-	blockReason, err := proj.engineForOutput(*jsonOut).StageClose(*run, *stage, *opID)
+	blockReason, err := proj.engineForOutput(*jsonOut).StageClose(*run, *stage, *opID, token)
 	if err != nil {
 		return err
 	}

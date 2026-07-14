@@ -38,15 +38,59 @@ Host-first transactional commands (`worker complete`, `review complete`,
 `operations/<op-id>.json` so a retry with the same id returns the same result
 without re-applying. `run start --op-id` is recorded globally under
 `.vichu/operations/run-start/<op-id>.json` (the run does not exist yet). Fields:
-`kind` (`worker.complete` / `stage.close` / `run-start` / …), `fp` (a digest of
-the operation's identifying args — reusing an op-id for a different operation is
-rejected), and the cached `worker_id` / `run_id` / `block_reason`.
+`kind` (`worker.complete` / `stage.close` / `run-start` / …), `fp` (a digest of the operation's
+identifying args and payload), and the cached `worker_id` / `run_id` / `block_reason`.
+
+Reusing an op-id for a **different** operation is rejected — **once this record exists**. That
+is the honest limit: the record is written **last**, so if the command applied its effects and
+then failed to write it, the id is free again and the next command may claim it. A record that
+exists but cannot be read also fails closed (it is what carries the id's identity, so we refuse
+rather than guess). Closing that last window means reserving the operation's identity *before*
+the work rather than after — a rework of the transaction layer, scheduled rather than patched.
+See [Known limits](../../README.md#known-limits).
+
+## `.vichu/rollback/` — rollback quarantine
+
+When a gate is blocked and rolled back, VichuFlow restores each pre-existing file it damaged.
+Almost always that is a direct overwrite. The one case it cannot do in place is a gate that
+**replaced a file with a directory** (`draft.txt` → `draft.txt/generated.js`): a non-empty
+directory cannot be renamed away, and cannot be deleted while it holds contents VichuFlow did
+not create.
+
+Rather than delete it — destroying data to undo the destruction of data — VichuFlow **moves**
+it to `.vichu/rollback/<hash>-<name>/`, beside a `<hash>-<name>.json` record naming where it
+came from and when. The original file is then restored over the space it vacates.
+
+Nothing here is ever cleaned up automatically; it is evidence. Inspect it, and once you have
+recovered anything you want, delete the entry yourself:
+
+```bash
+ls .vichu/rollback/             # what was moved aside, and its record
+rm -rf .vichu/rollback/<entry>  # once you've salvaged what you need
+```
 
 With the `filesystem` workspace provider, a sibling `.vichu/baseline/` holds the
 tree copy that run snapshots are taken against (plus `baseline.manifest` and
 `baseline.id`); the `git` provider uses the repository itself and writes no
-baseline. Either way, everything under `.vichu/` is runtime bookkeeping — it is
-gitignored, never counted as a worker mutation, and safe to delete between runs.
+baseline. Everything under `.vichu/` is gitignored and is never counted as a worker
+mutation.
+
+**What is safe to delete.** `.vichu/runs/` and the filesystem provider's `baseline/` are
+disposable once you have no runs you want to keep — deleting them throws away run history,
+nothing else.
+
+**`.vichu/hosts/`** records which permission rules `vichu init --host` added to *your*
+`.claude/settings.json`. Deleting it costs you nothing dangerous: `vichu uninstall` then has
+no idea which rules were ours, so it withdraws none and says so — you remove them by hand.
+
+It is deliberately **not** trusted for anything destructive. It lives inside your workspace,
+so a process there could have written it; VichuFlow treats its claims as a *proposal*, never
+as authority. That is why `uninstall` leaves permissions alone unless you pass
+`--withdraw-permissions`, and why **pack files are identified by content** (matching the pack
+compiled into the binary), not by anything a file in your repo says.
+
+For a full clean slate: `vichu uninstall --host <host> --withdraw-permissions`, then delete
+`.vichu/`.
 
 ## state.json
 
@@ -114,9 +158,16 @@ machine-readable contract, and views translate labels around them.
 { "pid": 4321, "hostname": "host", "run_id": "run-...", "acquired_at": "...", "heartbeat_at": "..." }
 ```
 
-The owning process renews `heartbeat_at` every 5s. A lock whose heartbeat is
-older than 30s, or whose owning process is gone, is treated as **orphaned** and
-can be reclaimed — this is how an interrupted run is safely resumed.
+The owning process renews `heartbeat_at` every 5s. A lock whose heartbeat is older than 30s,
+or whose owning process is gone, is treated as **orphaned** and can be reclaimed — this is how
+an interrupted run is resumed.
+
+> **This is a heuristic lease, not a guarantee — know its limits.** A live process that is
+> merely *stalled* for 30s (a suspended laptop, a slow network filesystem, antivirus scanning
+> every write) looks orphaned, and reclaiming is a delete-then-create rather than an atomic
+> swap. Two processes can therefore both believe they own a run. In practice:
+> **do not run two VichuFlow processes against the same run, and avoid NFS.** A real
+> OS-level lock (`flock` / `LockFileEx`) is planned.
 
 ## workspace.json
 
@@ -171,17 +222,62 @@ never silently becomes `approved`. `severity` is `blocker`, `major`, or `minor`.
 { "worker": "implement-02", "stage": "implement", "base_sha": "55728672...",
   "mutations": [
     { "path": "feature.py", "kind": "untracked", "hash": "2cf24dba...",
-      "added": 3, "deleted": 0, "out_of_scope": false, "sensitive": false }
+      "added": 3, "deleted": 0, "out_of_scope": false, "sensitive": false },
+    { "path": "coverage.out", "kind": "modified", "hash": "d2a84f4b...",
+      "added": 12, "deleted": 9, "derived": true },
+    { "path": ".claude/settings.local.json", "kind": "modified", "hash": "9f86d081...",
+      "added": 1, "deleted": 0, "sensitive": true, "host_bookkeeping": true }
   ],
   "captured_at": "..." }
 ```
 
-`kind` is `modified`, `added`, `deleted`, or `untracked`. `hash` is the file's
-content hash after the worker ran ("" for deletions) — resume uses it to tell
-the run's own changes apart from later external edits. `sensitive` flags changes
-to VCS/CI/config/lockfiles (blocking by default); `out_of_scope` flags changes
-outside a stage's declared scope. VichuFlow's own `.vichu/` directory is never
-reported as a mutation.
+`host_bookkeeping` marks the coding host's own machine-local permission file
+(`.claude/settings.local.json`), which the host rewrites the moment you approve a
+command — mid-run, on a file the agent never touched. VichuFlow **records** it like any
+other change, with its hash, but by default does **not** block on it
+(`security.hostLocalState: warn`); blocking would fail every read-only stage the first
+time you click "approve".
+
+It is recorded rather than hidden on purpose: that file *is* the host's permission
+allowlist, and in host-first mode VichuFlow does not launch the agent, so it cannot tell
+whether the host wrote it or the agent did. Not blocking is a decision we can defend;
+claiming the change never happened is not. Set `security.hostLocalState: block` to stop
+the run on any change to it — see
+[configuration.md](configuration.md#security).
+
+`kind` is `modified`, `added`, `deleted`, or `untracked`, and it describes the file's
+**lifecycle across this worker**, not its status against your VCS. A file that was
+*already* untracked when the worker started and that the worker then overwrote is
+`modified` — it was pre-existing work, and it was destroyed. Only a file the worker
+actually created is `untracked`.
+
+`hash` is the file's content hash after the worker ran ("" for deletions) — resume uses
+it to tell the run's own changes apart from later external edits. A **symlink** is
+fingerprinted by its *target text*, prefixed `symlink:`, never by the content it points
+at: retargeting a link is a mutation even when both targets hold identical bytes, and
+following it would fingerprint something the workspace does not own.
+
+`sensitive` flags changes to VCS/CI/config/lockfiles and to `.env*` (blocking by
+default); `out_of_scope` flags changes outside a stage's declared scope.
+
+`derived` flags a path your own ignore rules exclude. It is **informational** — recorded
+with its hash — and does NOT by itself exempt a change from the policy:
+
+- **Workers** get the normal mutation policy regardless of `derived`; the only exemption is
+  `host_bookkeeping` (the host rewriting its own settings). A read-only stage that rewrote a
+  gitignored file still blocks — an ignored path can be a private note or a credential.
+- **Gates** *build* — `go build`, `cargo test`, `npm run build` write coverage files, logs and
+  binaries — so a gate creating a **genuinely new** gitignored artifact only produces an event.
+  But a gate that **modifies or deletes a pre-existing** file (tracked, or untracked-and-present)
+  blocks by default; the escape hatch for legitimate build output is `security.gateOutputs`,
+  scoped to gates.
+
+A `sensitive` path (a gitignored `.env`) is never exempt, for a worker or a gate.
+
+Two things are **not** reported as mutations at all: VichuFlow's own `.vichu/` directory,
+and anything inside an **ignored directory** (`node_modules/`, `dist/`, `target/`). The
+second is a real limit, not an oversight — see
+[SECURITY.md](../../SECURITY.md#what-the-mutation-audit-does-and-does-not-see).
 
 ## Schema versioning
 
