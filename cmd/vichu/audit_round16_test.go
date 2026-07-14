@@ -280,3 +280,50 @@ func TestCancelValidatesTerminalAudit(t *testing.T) {
 		t.Fatal("cancel reported a terminal run as a clean finish over a corrupt audit")
 	}
 }
+
+// TestCancelTerminalRunDoesNotNeedWrite (ronda 27): canceling an already-terminal run must validate
+// its audit READ-ONLY — it will not modify the run, so it must not demand write access. A completed
+// run with a read-only (0444) but perfectly readable audit must report "already completed" and exit 0
+// without touching the file, not fail claiming the audit is unreadable.
+func TestCancelTerminalRunDoesNotNeedWrite(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX file modes do not restrict this way on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses 0444, so the read-only audit would be writable")
+	}
+	dir := t.TempDir()
+	t.Chdir(dir)
+	mustWrite(t, filepath.Join(dir, "vichu.yaml"),
+		"project: {name: f, language: go}\nworkflow: {default: quick}\nagents: {default: {provider: fake}}\ncommands: {test: \"true\"}\n")
+	store := rt.Open(dir)
+	if err := cmdRunStart([]string{"--workflow", "quick", "task"}); err != nil {
+		t.Fatal(err)
+	}
+	rid := runID(t, store)
+	st, _ := store.LoadState(rid)
+	st.Status = core.StatusCompleted
+	if err := store.SaveState(st); err != nil {
+		t.Fatal(err)
+	}
+	ev := filepath.Join(store.RunDir(rid), "events.ndjson")
+	before, err := os.ReadFile(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(ev, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(ev, 0o644) }() // let TempDir cleanup remove it
+
+	if err := cmdCancel([]string{rid}); err != nil {
+		t.Fatalf("cancel of a completed run with a read-only (but readable) audit must succeed: %v", err)
+	}
+	after, _ := os.ReadFile(ev)
+	if string(before) != string(after) {
+		t.Fatal("cancel modified the audit of a completed run")
+	}
+	if st2, _ := store.LoadState(rid); st2.Status != core.StatusCompleted {
+		t.Fatalf("cancel changed a completed run's status to %s", st2.Status)
+	}
+}

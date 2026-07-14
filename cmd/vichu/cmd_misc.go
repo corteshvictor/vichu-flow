@@ -117,24 +117,28 @@ func cmdCancel(args []string) error {
 	}
 	alreadyCanceled := state.Status == core.StatusCanceled
 
-	// Open the audit ONCE and HOLD the descriptor across validation → state save → append, so the
-	// run_canceled event lands on the EXACT file that was validated. Two separate opens (validate,
-	// then append) can see different files if the log is repointed in between — deleted OR replaced by
+	// A terminal run (completed/failed) is NOT going to be modified — validate its audit READ-ONLY and
+	// return. Opening the read+append handle we use for an active cancel would demand WRITE permission
+	// on a run we will not touch, so a legitimately read-only audit (e.g. mode 0444) would fail as if
+	// it were unreadable — a false error over a perfectly good log. But still refuse to report a clean
+	// finish over a corrupt one: an unreadable history is not a confirmed finish.
+	if state.Status.Terminal() && !alreadyCanceled {
+		if _, verr := proj.store.LoadVerifiedEvents(runID); verr != nil {
+			return fmt.Errorf("run %s is %s, but its audit is unreadable so its history cannot be confirmed: %w", runID, state.Status, verr)
+		}
+		fmt.Printf(i18n.T("cancel.already")+"\n", runID, state.Status)
+		return nil
+	}
+
+	// Active run (or repairing an already-canceled run whose event never landed): we WILL append, so
+	// open the audit ONCE and HOLD the descriptor across validation → state save → append. The
+	// run_canceled event lands on the EXACT file that was validated: two separate opens (validate, then
+	// append) can see different files if the log is repointed in between — deleted OR replaced by
 	// another regular file — and the event would be absorbed by the replacement while the real history
 	// is lost, with cancel still exiting 0. One descriptor closes that; Append's identity check reports
 	// a repointed path instead. A missing/corrupt log yields a nil handle and auditErr (escape hatch).
 	appender, verifiedEvents, auditErr := proj.store.OpenVerifiedAudit(runID)
 	defer func() { _ = appender.Close() }()
-
-	if state.Status.Terminal() && !alreadyCanceled {
-		// completed or failed — nothing to cancel and nothing to record, BUT do not claim so over a
-		// corrupt audit: a run whose history cannot be read is not a confirmed clean finish.
-		if auditErr != nil {
-			return fmt.Errorf("run %s is %s, but its audit is unreadable so its history cannot be confirmed: %w", runID, state.Status, auditErr)
-		}
-		fmt.Printf(i18n.T("cancel.already")+"\n", runID, state.Status)
-		return nil
-	}
 
 	// Two writes have to land: the run's STATE (authoritative — it is what stops the engine)
 	// and the audit EVENT. There is no transaction here yet, so one of them can land alone,
