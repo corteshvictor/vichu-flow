@@ -18,3 +18,11 @@ updates:
       interval: weekly
     commit-message:
       prefix: "ci(deps)"
+    # Bundle every GitHub Actions bump into ONE grouped PR instead of one PR per
+    # action, so a routine week of action updates is a single review + merge.
+    # Applies to future runs; to regroup the ones already open, comment
+    # `@dependabot recreate` on any of them.
+    groups:
+      github-actions:
+        patterns:
+          - "*"
