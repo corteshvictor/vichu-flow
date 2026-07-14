@@ -693,7 +693,11 @@ func copyHostPack(pr *projectRoot, plan *installPlan, undo *undoLog) ([]string, 
 		if plan.identical[f.Dest] {
 			continue
 		}
-		rel := filepath.FromSlash(f.Dest)
+		// Keep the manifest's forward-slash path: the confined-root writer parses it with the `path`
+		// package and converts to OS separators itself. Pre-converting to backslashes on Windows made
+		// path.Dir see no separator, so the temp landed at the root and the nested parents were never
+		// created — the rename then failed with "the system cannot find the path specified".
+		rel := f.Dest
 		if err := undo.before(rel); err != nil {
 			return written, err
 		}

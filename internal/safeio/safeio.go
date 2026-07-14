@@ -91,6 +91,7 @@ func (r *Root) WriteFileAtomic(rel string, data []byte, mode fs.FileMode) error 
 	if mode == 0 {
 		mode = 0o644
 	}
+	rel = filepath.ToSlash(rel) // accept OS-separator input; path.Dir/Base below need forward slashes
 	dir := path.Dir(rel)
 	if err := r.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -118,6 +119,7 @@ func (r *Root) WriteFileAtomic(rel string, data []byte, mode fs.FileMode) error 
 // RENAMED into place, so there is no window in which rel does not exist — a remove-then-
 // create leaves the path empty in between, and a crash there loses it entirely.
 func (r *Root) WriteSymlinkAtomic(rel, target string) error {
+	rel = filepath.ToSlash(rel) // accept OS-separator input; path.Dir below needs forward slashes
 	dir := path.Dir(rel)
 	if err := r.MkdirAll(dir, 0o755); err != nil {
 		return err
