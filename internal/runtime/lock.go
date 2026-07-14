@@ -82,6 +82,11 @@ func (s *Store) AcquireLockExisting(runID string) (*Handle, error) {
 }
 
 func (s *Store) acquireLock(runID string, createDir bool) (*Handle, error) {
+	// The scope (a run id, or the host-pack scope) becomes the lock file's directory, so an unsafe
+	// value could place the lock outside .vichu/runs. Refuse it before touching the filesystem.
+	if err := ValidateRunID(runID); err != nil {
+		return nil, err
+	}
 	host, _ := os.Hostname()
 	now := time.Now().UTC()
 	lk := core.Lock{

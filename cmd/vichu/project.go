@@ -117,6 +117,11 @@ func firstArg(positionals []string) string {
 // resolveRunID returns the given id, or the latest run if id is empty.
 func (p *project) resolveRunID(id string) (string, error) {
 	if id != "" {
+		// Reject a traversal/unsafe id with a clear message BEFORE it is turned into a path — the
+		// kernel enforces this too, this is just the friendlier CLI-side error.
+		if err := runtime.ValidateRunID(id); err != nil {
+			return "", err
+		}
 		if !p.store.RunExists(id) {
 			return "", fmt.Errorf(i18n.T("status.not_found"), id)
 		}

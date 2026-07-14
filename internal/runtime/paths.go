@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -46,6 +47,35 @@ func (s *Store) RunsDir() string { return filepath.Join(s.root, "runs") }
 
 // RunDir is .vichu/runs/<run-id>.
 func (s *Store) RunDir(runID string) string { return filepath.Join(s.RunsDir(), runID) }
+
+// ValidateRunID rejects a run id that is not a single, safe path component. The id is joined onto
+// .vichu/runs to build EVERY path for the run, so a value carrying a path separator, "." / "..", an
+// absolute path, a Windows volume or UNC prefix, a control character, or that is empty or over-long
+// could resolve OUTSIDE .vichu/runs — a run operation reading or writing another location in the
+// project (confinement only keeps paths inside the PROJECT, not inside the runs directory). This is
+// the check that keeps a run scoped to its own directory, so it must run BEFORE any path is built, any
+// lock is taken, or anything is read or written. It deliberately does NOT require a "run-" prefix:
+// ids minted by older versions and hand-created runs stay valid, so no migration is needed.
+func ValidateRunID(runID string) error {
+	switch {
+	case runID == "":
+		return fmt.Errorf("run id is empty")
+	case len(runID) > 128:
+		return fmt.Errorf("run id is too long (%d chars, max 128)", len(runID))
+	case runID == "." || runID == "..":
+		return fmt.Errorf("run id %q is not a valid run directory name", runID)
+	case strings.ContainsAny(runID, `/\`):
+		return fmt.Errorf("run id %q must not contain a path separator", runID)
+	case filepath.IsAbs(runID) || filepath.VolumeName(runID) != "":
+		return fmt.Errorf("run id %q must be a single relative component, not an absolute or volume path", runID)
+	}
+	for _, r := range runID {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("run id contains a control character (0x%02x)", r)
+		}
+	}
+	return nil
+}
 
 func (s *Store) statePath(runID string) string { return filepath.Join(s.RunDir(runID), "state.json") }
 func (s *Store) eventsPath(runID string) string {

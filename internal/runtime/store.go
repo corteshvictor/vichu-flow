@@ -43,6 +43,9 @@ func (s *Store) CreateRun(st *core.State) error {
 // SaveState atomically persists a run's state, stamping schema version and
 // timestamps. It mutates st.UpdatedAt (and CreatedAt / SchemaVersion if unset).
 func (s *Store) SaveState(st *core.State) error {
+	if err := ValidateRunID(st.RunID); err != nil {
+		return err
+	}
 	if st.SchemaVersion == 0 {
 		st.SchemaVersion = core.SchemaVersion
 	}
@@ -63,6 +66,9 @@ func (s *Store) SaveState(st *core.State) error {
 // newer fields — a lossy round-trip presented as success. A future state must be read by a
 // binary new enough for it.
 func (s *Store) LoadState(runID string) (*core.State, error) {
+	if err := ValidateRunID(runID); err != nil {
+		return nil, err
+	}
 	var st core.State
 	if err := readJSON(s.projectRoot, s.statePath(runID), &st); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -73,11 +79,20 @@ func (s *Store) LoadState(runID string) (*core.State, error) {
 	if st.SchemaVersion > core.SchemaVersion {
 		return nil, fmt.Errorf("run %s was written with schema_version %d, but this vichu understands only up to %d — upgrade vichu to read or drive this run (an older binary would silently drop its newer fields)", runID, st.SchemaVersion, core.SchemaVersion)
 	}
+	// Defense in depth: the state read from runs/<runID> must call ITSELF runID. A mismatch means the
+	// id resolved to some other run's (or a planted) state.json — do not act on it as this run.
+	if st.RunID != "" && st.RunID != runID {
+		return nil, fmt.Errorf("run %q loaded a state that identifies as %q — refusing to act on a mismatched run", runID, st.RunID)
+	}
 	return &st, nil
 }
 
-// RunExists reports whether a run directory with a state.json exists.
+// RunExists reports whether a run directory with a state.json exists. An id that is not a safe run
+// directory name "does not exist" — it is refused before it can be turned into a path.
 func (s *Store) RunExists(runID string) bool {
+	if ValidateRunID(runID) != nil {
+		return false
+	}
 	ok, _ := existsConfined(s.projectRoot, s.statePath(runID))
 	return ok
 }
@@ -117,6 +132,9 @@ const maxEventLineBytes = 8 * 1024 * 1024
 // AppendEvent appends one normalized event to the run's events.ndjson, creating it if absent (the
 // first event, run_created, is what materializes the log).
 func (s *Store) AppendEvent(ev core.Event) error {
+	if err := ValidateRunID(ev.Run); err != nil {
+		return err
+	}
 	if ev.TS.IsZero() {
 		ev.TS = time.Now().UTC()
 	}
@@ -164,6 +182,9 @@ type AuditAppender struct {
 // same descriptor. A missing or corrupt log returns a nil handle and an error (a materialized run
 // always has a coherent one). The caller MUST Close the returned handle (nil-safe).
 func (s *Store) OpenVerifiedAudit(runID string) (*AuditAppender, []core.Event, error) {
+	if err := ValidateRunID(runID); err != nil {
+		return nil, nil, err
+	}
 	path := s.eventsPath(runID)
 	r, rel, err := confine(s.projectRoot, path)
 	if err != nil {

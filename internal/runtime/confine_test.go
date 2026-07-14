@@ -471,6 +471,99 @@ func TestOpenVerifiedAuditDetectsReplacement(t *testing.T) {
 	}
 }
 
+// TestValidateRunID (ronda 27): a run id is a single path component. Reject traversal, separators,
+// absolute paths, control chars, empty and over-long; accept minted, test and hand-created ids.
+func TestValidateRunID(t *testing.T) {
+	bad := []string{
+		"", ".", "..", "../victim", "../../victim", "a/b", `a\b`, "/abs", "run\x00id", "run\nid",
+		strings.Repeat("x", 129),
+	}
+	for _, id := range bad {
+		if err := ValidateRunID(id); err == nil {
+			t.Errorf("ValidateRunID(%q) = nil, want error", id)
+		}
+	}
+	good := []string{
+		"run-20260714-050110-e69727fd9637", // minted
+		"run-1",                            // test id
+		"legacy_run.42",                    // hand-created, safe component
+		"hostpack",                         // the reserved lock scope
+	}
+	for _, id := range good {
+		if err := ValidateRunID(id); err != nil {
+			t.Errorf("ValidateRunID(%q) = %v, want nil", id, err)
+		}
+	}
+}
+
+// TestStoreRefusesTraversalRunID (ronda 27) is the path-traversal regression: a run id like
+// "../../victim" resolves (via filepath.Join onto .vichu/runs) to <project>/victim — inside the
+// project, so confinement allows it, but OUTSIDE the runs directory. Every Store entry must refuse it
+// before building a path, so a run operation cannot read or write another location in the project.
+func TestStoreRefusesTraversalRunID(t *testing.T) {
+	project := t.TempDir()
+	s := Open(project)
+	// A would-be victim OUTSIDE .vichu/runs but inside the project.
+	victimDir := filepath.Join(project, "victim")
+	victimState := filepath.Join(victimDir, "state.json")
+	if err := os.MkdirAll(victimDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(victimState, []byte(`{"run_id":"victim","status":"active"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	trav := "../../victim" // from .vichu/runs: runs/.. = .vichu, .vichu/.. = project, then /victim
+	if s.RunExists(trav) {
+		t.Fatal("RunExists accepted a traversal run id")
+	}
+	if _, err := s.LoadState(trav); err == nil {
+		t.Fatal("LoadState accepted a traversal run id")
+	}
+	if err := s.SaveState(&core.State{RunID: trav, Status: core.StatusCanceled}); err == nil {
+		t.Fatal("SaveState accepted a traversal run id")
+	}
+	if err := s.AppendEvent(core.Event{Run: trav, Event: core.EventRunCanceled}); err == nil {
+		t.Fatal("AppendEvent accepted a traversal run id")
+	}
+	if _, _, err := s.OpenVerifiedAudit(trav); err == nil {
+		t.Fatal("OpenVerifiedAudit accepted a traversal run id")
+	}
+	if _, err := s.AcquireLockExisting(trav); err == nil {
+		t.Fatal("AcquireLockExisting accepted a traversal run id")
+	}
+
+	// The victim is untouched: no run_canceled, no events.ndjson, no lock created next to it.
+	got, _ := os.ReadFile(victimState)
+	if strings.Contains(string(got), "canceled") {
+		t.Fatalf("a traversal run id mutated state.json outside .vichu/runs:\n%s", got)
+	}
+	if _, err := os.Stat(filepath.Join(victimDir, "events.ndjson")); err == nil {
+		t.Fatal("a traversal run id created events.ndjson outside .vichu/runs")
+	}
+	if _, err := os.Stat(filepath.Join(victimDir, "lock.json")); err == nil {
+		t.Fatal("a traversal run id created a lock outside .vichu/runs")
+	}
+}
+
+// TestLoadStateRejectsMismatchedRunID (ronda 27): the state read from runs/<id> must identify as
+// <id>. A state.json whose run_id names a DIFFERENT run means the id resolved to the wrong run's
+// state — do not act on it.
+func TestLoadStateRejectsMismatchedRunID(t *testing.T) {
+	project := t.TempDir()
+	s := Open(project)
+	if err := s.CreateRun(&core.State{RunID: "run-2", Status: core.StatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	// Move runs/run-2 to runs/run-1, so runs/run-1/state.json still says run_id "run-2".
+	if err := os.Rename(s.RunDir("run-2"), s.RunDir("run-1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LoadState("run-1"); err == nil {
+		t.Fatal("LoadState accepted a state.json whose run_id is run-2 under runs/run-1")
+	}
+}
+
 // TestOpenVerifiedAuditRejectsMissingAndCorrupt (ronda 26): a missing or corrupt log yields a nil
 // handle and an error, so cancel's escape hatch reports the loss instead of appending onto nothing.
 func TestOpenVerifiedAuditRejectsMissingAndCorrupt(t *testing.T) {
