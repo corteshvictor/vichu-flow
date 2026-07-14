@@ -10,9 +10,14 @@ the coding agent you already use (`vichu init --host claude-code`). You talk to
 your agent; an orchestrator skill classifies the request, delegates the coding to
 **native subagents**, and drives a verified run by calling the `vichu` kernel for
 everything that must be trustworthy (state, gates, mutation audit, transitions).
-The kernel commands it calls — `run start`, `worker start`/`complete`,
-`review complete`, `stage close`, `run resume` — are transactional, idempotent
-(`--op-id`), and single-writer (only the kernel writes `.vichu/runs`).
+The kernel is the only writer under `.vichu/runs`. Commands that mutate an
+existing run (`worker start`/`complete`, `review complete`, `stage close`, and
+`run resume`) take the per-run lock. `worker start`/`complete`,
+`review complete`, and `stage close` support retry safety through `--op-id`.
+`run start` uses a global `--op-id` reservation because the run does not exist
+yet. `run resume` is a human action that rotates the driver token and does not
+take `--op-id`. `status --json` and `observe` are read-only views: they take no
+lock, accept no `--op-id`, and perform no writes.
 
 **Adapters** are the *fallback*: when there's no host pack (CI, automation, a host
 without integration), `vichu exec` runs the whole workflow headless and launches
@@ -24,8 +29,10 @@ vs. the binary). `vichu run "task"` is a deprecated alias for `vichu exec`.
 
 The **runtime** is the source of truth for a run: a directory of flat files
 under `.vichu/runs/<run-id>/`. The CLI reads it today; a TUI and web dashboard are
-planned as additional views over the same files. Because everything is on disk and
-written atomically, a run survives a crash and can be resumed or audited later. See
+planned as additional views over the same files. Because it is on disk — `state.json`
+by atomic replace, `events.ndjson` append-only — a run survives a crash and can be
+resumed or audited later. (A few multi-write sequences are not yet a single
+transaction; those windows are listed in the README's Known limits.) See
 [runtime-format.md](runtime-format.md) for the exact files.
 
 The guiding rule: **the runtime does not trust the agent.** Anything that can be

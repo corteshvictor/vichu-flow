@@ -78,7 +78,13 @@ tracked by git tags and `CHANGELOG.md`, not hardcoded here. The current build
 ships:
 
 - **Host packs** (`vichu init --host claude-code`): install the orchestrator skill + native subagents into your coding agent, then drive verified runs by talking to it. The kernel owns state and gates; the host runs the agents.
-- **Host-first kernel commands** the pack drives: `run start` · `worker start`/`complete` · `review complete` · `stage close` · `run resume` · `status --json` · `observe` — each takes the run lock, records its evidence, and is retry-safe via `--op-id`. See [Known limits](#known-limits) for where that recovery is still being hardened.
+- **Host-first kernel commands** the pack drives, in four kinds — they are *not* uniform, and the next host should not assume they are:
+  - `worker start`/`complete` · `review complete` · `stage close` — take the run lock, record their evidence, and are retry-safe via `--op-id`.
+  - `run start` — creates the run and issues its driver token; `--op-id` makes the *creation* retry-safe (a global reservation, since the run does not exist yet to be locked).
+  - `run resume` — a human action, under the run lock, that rotates the driver token; it does **not** take `--op-id`.
+  - `status --json` · `observe` — read-only views of a live run: no lock, no `--op-id`, no writes.
+
+  See [Known limits](#known-limits) for where the transactional recovery of the mutating commands is still being hardened.
 - `vichu init [--template]`, `new`, `doctor`, `exec` (headless fallback), `status [--watch]`, `cancel`, `adapters`, `config`
 - **Project templates** (`vichu new <name> --template go|node|python|rust|empty`, or `vichu init --template`): scaffold a runnable project with a real gate, so the first run completes from scratch — Git optional
 - Persistent runtime: atomic `state.json`, append-only `events.ndjson`, heartbeat locks with orphan reclaim, cooperative cancel
