@@ -28,7 +28,7 @@ editor (no external record, no resume after a crash) or fan out parallel agents
 with a diff UI (no workflow, no verified gates). VichuFlow is the missing piece:
 an **external runtime that doesn't trust the agent**.
 
-- **It can't lie to you.** A run only **completes** when VichuFlow runs your tests
+- **It won't take the agent's word for it.** A run only **completes** when VichuFlow runs your tests
   itself and the verify gate passes; intermediate stages advance only on
   kernel-validated evidence — a mutation audit, an artifact's provenance, a
   structured review verdict — never the agent's say-so. An agent that claims success
