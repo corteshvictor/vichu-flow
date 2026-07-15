@@ -1,6 +1,6 @@
 # VichuFlow
 
-> An installable, verifiable agentic workflow for your coding assistant.
+> **The runtime that doesn't take your coding agent's word for it** — it verifies every step against your tests, lint, and typecheck, itself.
 
 [![CI](https://github.com/corteshvictor/vichu-flow/actions/workflows/ci.yml/badge.svg)](https://github.com/corteshvictor/vichu-flow/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/corteshvictor/vichu-flow.svg)](https://pkg.go.dev/github.com/corteshvictor/vichu-flow)
